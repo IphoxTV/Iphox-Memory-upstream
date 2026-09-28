@@ -16,6 +16,19 @@ DATA_DIR ?= ./data
 # `obsidian-mcp-postgres`; a shared host instance is usually just `postgres`.
 # Override in Makefile.local to match the deployment.
 DB_CONTAINER ?= postgres
+# Where db-backup / db-restore (and docker/record-backup.sh) reach PostgreSQL,
+# through docker/db-exec.sh — one channel for the dump and its backups_log row:
+#   docker (default)  `docker exec $(DB_CONTAINER) …`
+#   cnpg              the primary of CloudNativePG cluster $(CNPG_CLUSTER) in
+#                     namespace $(CNPG_NAMESPACE), via `kubectl exec` into its
+#                     `postgres` container (local socket, peer auth, no password).
+# A Kubernetes deployment sets `DB_BACKEND := cnpg` (and KUBECONFIG, if not the
+# default) in Makefile.local.
+DB_BACKEND ?= docker
+CNPG_NAMESPACE ?= db
+CNPG_CLUSTER ?= pg
+KUBECTL ?= kubectl
+DB_EXEC = DB_BACKEND=$(DB_BACKEND) DB_CONTAINER=$(DB_CONTAINER) CNPG_NAMESPACE=$(CNPG_NAMESPACE) CNPG_CLUSTER=$(CNPG_CLUSTER) KUBECTL=$(KUBECTL) bash docker/db-exec.sh
 # The application container, as named in docker-compose.yml.
 CONTAINER ?= obsidian-mcp
 COMPOSE_FILE := $(DEPLOY_DIR)/docker-compose.yml
@@ -329,10 +342,10 @@ db-backup:
 	@umask 077; TIMESTAMP=$$(date +%Y%m%d_%H%M%S); \
 	BACKUP_FILE="$(DATA_DIR)/backups/backup_$$TIMESTAMP.sql"; \
 	: "the database named here is mirrored as DB_NAME's default in docker/record-backup.sh; keep the two in step"; \
-	if ! docker exec $(DB_CONTAINER) pg_dump -U postgres obsidian_mcp > $$BACKUP_FILE; then \
+	if ! $(DB_EXEC) pg_dump -U postgres obsidian_mcp > $$BACKUP_FILE; then \
 		rm -f $$BACKUP_FILE; \
-		echo "$(RED)Backup FAILED: pg_dump against container '$(DB_CONTAINER)' returned non-zero$(NC)"; \
-		echo "$(YELLOW)Set DB_CONTAINER in Makefile.local if the database container is named differently.$(NC)"; \
+		echo "$(RED)Backup FAILED: pg_dump through DB_BACKEND=$(DB_BACKEND) returned non-zero$(NC)"; \
+		echo "$(YELLOW)Set DB_BACKEND / DB_CONTAINER (docker) or CNPG_NAMESPACE / CNPG_CLUSTER (cnpg) in Makefile.local to match the deployment.$(NC)"; \
 		exit 1; \
 	fi; \
 	if [ ! -s $$BACKUP_FILE ]; then \
@@ -360,7 +373,7 @@ db-backup:
 		fi; \
 	done; \
 	if [ $$PRUNED -gt 0 ]; then echo "$(YELLOW)Pruned $$PRUNED backup(s) older than $(BACKUP_RETAIN_DAYS) days (kept at least $(BACKUP_RETAIN_MIN))$(NC)"; fi; \
-	DB_CONTAINER=$(DB_CONTAINER) bash docker/record-backup.sh $$BACKUP_FILE.gz
+	DB_BACKEND=$(DB_BACKEND) DB_CONTAINER=$(DB_CONTAINER) CNPG_NAMESPACE=$(CNPG_NAMESPACE) CNPG_CLUSTER=$(CNPG_CLUSTER) KUBECTL=$(KUBECTL) bash docker/record-backup.sh $$BACKUP_FILE.gz
 
 db-restore:
 	@if [ -z "$(FILE)" ]; then echo "$(RED)Usage: make db-restore FILE=<path>$(NC)"; exit 1; fi
@@ -368,9 +381,9 @@ db-restore:
 	@echo "Press Ctrl+C to cancel, waiting 5s..."
 	@sleep 5
 	@if echo "$(FILE)" | grep -q ".gz$$"; then \
-		gunzip -c $(FILE) | docker exec -i $(DB_CONTAINER) psql -U postgres obsidian_mcp; \
+		gunzip -c $(FILE) | $(DB_EXEC) -i psql -U postgres obsidian_mcp; \
 	else \
-		docker exec -i $(DB_CONTAINER) psql -U postgres obsidian_mcp < $(FILE); \
+		$(DB_EXEC) -i psql -U postgres obsidian_mcp < $(FILE); \
 	fi
 	@echo "$(GREEN)Restored from $(FILE)$(NC)"
 
