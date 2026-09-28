@@ -761,6 +761,15 @@ With CloudNativePG, prefer its own WAL-archive backups and keep this
 component for the `backups_log` record, or record your own backups in that
 table.
 
+`make db-backup` / `make db-restore` also work against a CloudNativePG
+cluster from an operator's machine: set `DB_BACKEND := cnpg` (plus
+`CNPG_NAMESPACE` / `CNPG_CLUSTER` if they are not `db` / `pg`, and
+`export KUBECONFIG := …` if needed) in `Makefile.local`. The dump, the
+restore and the `backups_log` row then go through `kubectl exec` into the
+cluster's current primary (`docker/db-exec.sh`), over its local socket as the
+operator's `postgres` user, so no superuser password is needed and
+`enableSuperuserAccess: false` is fine.
+
 **Restore** (tested against the bundled Postgres, as the non-superuser app
 role). It restores into a *new* database and swaps it in only after the load
 succeeds, so the current database is never dropped on the strength of an
