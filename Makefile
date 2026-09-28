@@ -377,15 +377,8 @@ db-backup:
 
 db-restore:
 	@if [ -z "$(FILE)" ]; then echo "$(RED)Usage: make db-restore FILE=<path>$(NC)"; exit 1; fi
-	@echo "$(YELLOW)WARNING: This will replace the obsidian_mcp database!$(NC)"
-	@echo "Press Ctrl+C to cancel, waiting 5s..."
-	@sleep 5
-	@if echo "$(FILE)" | grep -q ".gz$$"; then \
-		gunzip -c $(FILE) | $(DB_EXEC) -i psql -U postgres obsidian_mcp; \
-	else \
-		$(DB_EXEC) -i psql -U postgres obsidian_mcp < $(FILE); \
-	fi
-	@echo "$(GREEN)Restored from $(FILE)$(NC)"
+	@: "docker/db-restore.sh verifies the WHOLE file (exists, gzip -t, pg_dump end marker) before sending anything, then restores with ON_ERROR_STOP=1 --single-transaction"
+	@DB_BACKEND=$(DB_BACKEND) DB_CONTAINER=$(DB_CONTAINER) CNPG_NAMESPACE=$(CNPG_NAMESPACE) CNPG_CLUSTER=$(CNPG_CLUSTER) KUBECTL=$(KUBECTL) bash docker/db-restore.sh "$(FILE)"
 
 # There is no headless trigger. The only on-demand reindex is
 # `POST /admin/settings/reindex` (src/control_panel/routes.py), which sits on

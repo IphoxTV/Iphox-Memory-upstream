@@ -469,13 +469,19 @@ def test_the_recording_script_goes_through_the_dump_channel():
         line for line in script.splitlines() if not line.lstrip().startswith("#")
     ), "the recording must not open a second channel of its own"
     make = _makefile()
-    for target, nxt in (("\ndb-backup:", "\ndb-restore:"), ("\ndb-restore:", "\n# There is no headless")):
-        recipe = make[make.index(target) : make.index(nxt)]
+    backup = make[make.index("\ndb-backup:") : make.index("\ndb-restore:")]
+    restore = make[make.index("\ndb-restore:") : make.index("\n# There is no headless")]
+    for target, recipe in (("db-backup", backup), ("db-restore", restore)):
         commands = "\n".join(
             line for line in recipe.splitlines() if not line.strip().startswith("#")
         )
         assert "docker exec" not in commands, target
-        assert "$(DB_EXEC)" in commands, target
+    assert "$(DB_EXEC)" in backup
+    assert "bash docker/db-restore.sh" in restore
+    with open(os.path.join(HERE, "..", "docker", "db-restore.sh")) as fh:
+        restore_script = fh.read()
+    assert 'bash "$DB_EXEC_SCRIPT" -i psql' in restore_script
+    assert "docker exec" not in restore_script
     assert "to_regclass('public.backups_log')" in script
     assert "ON_ERROR_STOP=1" in script
     # The filename and size travel as psql variables, not as interpolated
