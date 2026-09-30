@@ -1,29 +1,29 @@
 ## 1. NUL-free derivation (D1, D2)
 
 - [ ] 1.1 `read_note_at`: remove `\x00` from the decoded text before returning; one WARNING per read with vault-relative path and count, no content
-- [ ] 1.2 Confirm (grep) that no writer of `notes_metadata.content_hash` outside the indexer hashes un-stripped text; record the finding in the PR
+- [ ] 1.2 `vault.note_title` and `vault.extract_tags` (shared by indexer, `read_note` metadata, `move_note`): remove `\x00` from results
 - [ ] 1.3 `_jsonb_value`: remove `\x00` from string keys and values on the existing walk (first-key-wins collision rule unchanged)
-- [ ] 1.4 `_note_title` and `extract_tags`: remove `\x00` from outputs
-- [ ] 1.5 Unit tests: NUL-free text and hash unchanged; body NUL removed; YAML-escaped NUL in title/tags/keys removed; `set_frontmatter` round-trip unchanged
+- [ ] 1.4 `links.py`: a link whose decoded target/anchor/alias contains `\x00` is not extracted (markdown `%00` and wikilink forms)
+- [ ] 1.5 Unit tests: NUL-free text and hash unchanged; body NUL removed; YAML-escaped NUL in title/tags/keys removed on every surface; `[x](bad%00target.md)` yields no link; `set_frontmatter` round-trip unchanged
 
 ## 2. Poison-note quarantine (D3, D5)
 
 - [ ] 2.1 Quarantine registry in `indexer.py` keyed by `(owner, rel_path)` → `(content_hash, sqlstate, at)`, with clear-on-success/delete/discard
 - [ ] 2.2 Poison classification helper: SQLSTATE class 22 or 54000, unwrapping SQLAlchemy/asyncpg exceptions
-- [ ] 2.3 Incremental pass: floor failure of `write_tsvector_bounded` with a poison SQLSTATE raises `PoisonNote`; the rebuild path is unchanged
-- [ ] 2.4 Batch upsert: on a poison-class error, replay the batch row-by-row in savepoints to identify the offender, then raise `PoisonNote`; if no row fails alone, re-raise the original error
-- [ ] 2.5 Pass classification excludes a note whose current hash equals its quarantined hash from `to_upsert`, without counting it as a read failure or a re-derive skip
-- [ ] 2.6 Re-run loop in `_index_pass_once` bounded by `INDEXER_QUARANTINE_RETRIES_PER_TICK` (config, default 5)
-- [ ] 2.7 Run record `error` names quarantined paths (≤ 5, then `…`); one ERROR log per quarantine
-- [ ] 2.8 Move the NUL-fixture floor tests in `tests/integration/test_tsvector_bounded_pg.py` to a synthetic 54000 floor failure and assert quarantine semantics
-- [ ] 2.9 Integration tests (real Postgres): #308 repro indexes and is searchable; NUL note embeds; poison tsvector note quarantined while others commit; poison upsert row identified; edit clears quarantine; quarantine does not re-arm re-derive/full-hash; retry bound exceeded fails the pass
+- [ ] 2.3 Savepoint every attributable write site (move UPDATE, batch upsert, tsvector floor in the incremental pass, link inserts), `try` outside `begin_nested()`; batch sites replay per row in savepoints to attribute; unattributable → re-raise
+- [ ] 2.4 `PoisonNote` → full rollback → re-run from classification; bound `INDEXER_QUARANTINE_RETRIES_PER_TICK` (config, default 5); lives in `index_vault` (or a wrapper every caller uses) so startup, periodic and manual reindex all recover
+- [ ] 2.5 Classification: a file whose hash equals its quarantined hash is excluded from upsert and move detection; any existing row at that path is deleted (with embeddings and outgoing links) through the ordinary delete path; not a read failure, not a re-derive skip, does not keep the scope due
+- [ ] 2.6 Run record `error` names quarantined paths (≤ 5, then `…`) without the pass counting as failed; one ERROR log per quarantine
+- [ ] 2.7 `tests/integration/test_tsvector_bounded_pg.py`: incremental NUL-fixture test → genuine server-side floor failure (temporary trigger) asserting quarantine + rest committed; full-rebuild test (:249-273) keeps whole-rebuild rollback with the synthetic trigger
+- [ ] 2.8 Integration tests (real Postgres), per design D6: #308 repro + next tick writes nothing; NUL note embeds; each attributable site (move > 1024 chars, upsert row, tsvector, link row) after an earlier successful move; indexed+embedded note turned poison is removed, not served stale by either search tool; edit clears quarantine; re-derive with quarantine stamps provenance and next tick re-upserts nothing; retry bound; startup and manual reindex entrypoints
 
 ## 3. Failure accounting and `/health` (D4)
 
-- [ ] 3.1 Per-scope failure registry updated from `_index_pass_once` in both modes; replace the local counter in `run_indexer_loop`
-- [ ] 3.2 `INDEXER_DEGRADED_AFTER_FAILURES` (default 3); CRITICAL log once on reaching it, re-armed on success
-- [ ] 3.3 `/health`: add `indexer` object and `degraded` top-level status; HTTP 200; no paths/errors/ids; update docstring
-- [ ] 3.4 Unit tests: ok, degraded by failures, degraded by quarantine, multi-user counting, body contains no path
+- [ ] 3.1 Per-scope registry: index failures, embedding failures (from typed `EmbedPassResult` provider failures), last success/failure; enumeration-failure counter; updated from every entrypoint in both modes; replace the local counter in `run_indexer_loop`
+- [ ] 3.2 `_on_indexer_done` records "task not running" on exception/unexpected return, not on lifespan cancellation; `disabled` under `MCP_SANDBOX_MODE`
+- [ ] 3.3 `INDEXER_DEGRADED_AFTER_FAILURES` (default 3); CRITICAL log once per counter on reaching it, re-armed on reset
+- [ ] 3.4 `/health`: `indexer` object and `degraded` top-level status per spec; HTTP 200; no paths/errors/ids; update docstring
+- [ ] 3.5 Unit tests: ok; degraded by index failures / embedding failures / dead task / enumeration failures / quarantine; disabled; multi-user counting; CRITICAL-once; body contains no path or id
 
 ## 4. Docs
 

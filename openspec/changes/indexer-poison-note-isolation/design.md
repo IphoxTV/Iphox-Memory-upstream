@@ -41,53 +41,80 @@ Constraints carried from `docs/architecture/indexing-and-embeddings.md` that thi
 - *Hash the raw bytes, strip after:* rejected — the hash must describe what was indexed, and every re-verifier would need the same split.
 - The warning fires on each actual read, which after the first pass is at most once per full-hash interval (24 h) per file thanks to the stat shortcut. Acceptable; it is the operator's pointer to the file.
 
-### D2. Remove NUL from frontmatter-derived strings at the indexer's JSON boundary
+### D2. Remove NUL from derived title and tags in the shared helpers; from JSONB at the indexer boundary; refuse NUL-bearing link targets
 
-YAML `"\0"` produces a real NUL from NUL-free bytes, so D1 does not cover it. `_jsonb_value` removes NUL from every string key and value on its existing walk (same place #154 converts non-finite floats; key-collision rule unchanged: first in document order wins); `_note_title` and `extract_tags` remove NUL from their outputs. The parsed mapping `set_frontmatter` re-serialises is **not** touched — the #154 rule.
+YAML `"\0"` produces a NUL from NUL-free bytes, so D1 does not cover frontmatter.
 
-### D3. Quarantine a poison note by restarting the pass without it
+- **Title and tags — shared normalization.** `vault.note_title` and `vault.extract_tags` are the one derivation used by the indexer (`_note_title` wraps the former), `read_note`'s metadata (`vault.py:2079-2080`) and `move_note` (`tools.py:5281,5337`). NUL is removed inside those two shared functions, so every surface shows the same title and tags — the #154 "one title rule" extended, not forked. Raw note content and the parsed frontmatter mapping returned by `read_note` / re-serialised by `set_frontmatter` are **not** touched.
+- **JSONB.** `_jsonb_value` removes NUL from every string key and value on its existing walk (same boundary #154 uses; first-key-wins collision rule unchanged).
+- **Link targets.** Markdown hrefs are percent-decoded (`links.py:754`), so `[x](bad%00target.md)` yields a NUL from NUL-free text. Removing the NUL would *invent* a link to `badtarget.md`, a different file. A link whose decoded target, anchor or alias contains U+0000 is therefore **not a link**: the extractor drops it, exactly as it drops an empty href. Same for wikilink parts (the regex at `links.py:75` admits NUL; after D1 the body has none, but the rule is stated at the extractor so it holds for any input).
 
-A **poison failure** is a database error raised while writing one identifiable note's derived data whose SQLSTATE is in class 22 (data exception — includes 22021 `character_not_in_repertoire`, 22P02, 22003, 22001, 2200N) or 54000 (`program_limit_exceeded`), at either of two sites:
+### D3. Quarantine: a poison note is removed from the index, never kept stale
 
-1. `write_tsvector_bounded` failing at the floor during the **incremental pass** (the rebuild is excluded — it keeps its atomic abort);
-2. the **batch upsert** raising such an error. The batch is then re-executed row by row, each row in its own savepoint, to identify the first offending note (the batch is ≤ 100 rows; this cost is paid only on failure).
+**Poison failure.** A database error whose SQLSTATE is class 22 (data exception — 22021, 22P02, 22003, 22001, 2200N…) or 54000 (program limit exceeded), raised by a write attributable to exactly one note during an **incremental** index pass. The attributable write sites are all of the pass's per-note writes:
 
-On a poison failure the pass raises an internal `PoisonNote(owner, rel_path, content_hash, sqlstate)`, the transaction rolls back as today, the note is added to the **quarantine**, and the pass is re-run immediately for the same scope. At most `INDEXER_QUARANTINE_RETRIES_PER_TICK` (default 5) re-runs per scope per tick; exceeding it fails the pass as today (and counts toward D4).
+1. the id-preserving **move** UPDATE (e.g. a destination path over `file_path`'s 1024 limit → 22001);
+2. the **batch upsert**;
+3. the **keyword-vector** build failing at its floor;
+4. the note's **link** inserts.
 
-The quarantine is an in-process map keyed by `(owner, rel_path)` holding the `content_hash` that failed, the SQLSTATE and the time. In the pass's classification, a note whose current `content_hash` equals its quarantined hash is **excluded from `to_upsert`** — its existing row (if any) is left exactly as it was: old hash, old tsvector, old links, old embeddings. That is the invariant the "no skip list" rule protects: nothing is committed for the note, so no committed hash sits beside a stale derived row. When the file's content hash changes, the entry no longer matches and the note is tried again (and re-quarantined if it still fails). The entry is removed when the note indexes successfully, is deleted, or its scope is discarded.
+Each site runs inside a savepoint (`async with session.begin_nested()`, `try` *outside* the context, as `write_tsvector_bounded` already does), so a failure leaves the outer transaction usable. A batch statement (upsert, links) that fails with a poison SQLSTATE is replayed one row at a time, each row in its own savepoint, to find the offending note; if no single row fails alone, the error is not a poison failure and is re-raised. The rebuild (`rebuild_tsvectors`) is excluded and stays atomic.
 
-- *Why restart instead of a savepoint per note:* the upsert is batched and the tsvector writes run after it in the same transaction, so a per-note savepoint would mean un-batching the upsert on the happy path (perf regression on every pass) or reverting an already-upserted row. Restart costs nothing on the happy path and at most N extra partial passes when a poison note first appears.
-- *Why in-process, not a table:* no migration, and a restart re-learns each poison note at the cost of one aborted attempt per note. With D1/D2 no known input reaches this path; it is the backstop for the next unknown one, so its state need not be durable.
-- *Quarantine is not a read failure.* The note was read and hashed; it is excluded by decision. It SHALL NOT keep the scope due for a full-hash pass, and it SHALL NOT make a re-derive "incomplete" — otherwise a single quarantined note re-arms the whole-scope rewrite loop through the re-derive path (index-integrity "A re-derive that skipped any file is incomplete…"). The re-derive records completion; the quarantined note is simply absent from the re-derived index until its content changes. That is the declared degradation.
-- A quarantined note is logged at ERROR once when quarantined (path, SQLSTATE; no content), not on every pass.
+**Restart, not repair-in-place.** Once the offending note is identified the pass raises `PoisonNote(owner, rel_path, content_hash, sqlstate)`; the whole transaction rolls back and the pass is re-run **from classification** (moves included), with the note in the quarantine. Repairing in place would leave move bookkeeping (`moved_new_paths`, the `to_upsert` exclusions at `indexer.py:2594-2612`) describing writes that were undone. At most `INDEXER_QUARANTINE_RETRIES_PER_TICK` (default 5) restarts per scope per invocation; beyond that the pass fails as today and counts toward D4.
 
-### D4. Count failures per scope in both loops; expose on `/health`
+**What a quarantined note looks like in the index: absent.** The quarantine is an in-process map keyed by `(owner, rel_path)` holding the failed `content_hash`, SQLSTATE and time. During classification a file whose current hash equals its quarantined hash is treated as **present on disk but not indexable**: it is excluded from `to_upsert` and from move detection (as source or destination), and **any existing row at that path is deleted in the same transaction**, with its embeddings and outgoing links, through the pass's ordinary delete path. So:
 
-A module-level registry in `indexer.py` holds, per scope (`None` for single-user, `user_id` otherwise): `consecutive_failures`, `last_success_at`, `last_failure_at`. `_index_pass_once` updates it in both modes; the existing CRITICAL log fires once when a scope first reaches `INDEXER_DEGRADED_AFTER_FAILURES` (default 3 — ~18 min at the default interval; the old hard-coded 5 is replaced), not every tick thereafter.
+- no committed `content_hash` is ever paired with derived data from other content (the hard invariant), and
+- **search never serves a quarantined note's superseded content as current.** Keeping the old row would do exactly that — `semantic_search` computes staleness only as `embedded_content_hash != content_hash` (`embeddings.py:1629,1647`) and the old row satisfies it. Absence is the same degradation an unreadable file already has, and `read_note` still reads the file from disk.
+- Inbound links to the note lose their resolution (`ON DELETE SET NULL`), as for any deleted-and-recreated note; they re-resolve when the note returns, subject to the pre-existing limitation recorded at `openspec/specs/index-integrity/spec.md:217`. Accepted; this path is reached only by an input D1/D2 do not already neutralise.
+
+**A quarantine is not a read failure and does not make a re-derive incomplete.** The file was read and hashed; its row is absent by decision, so a re-derive that quarantines a note has still established, for every row it leaves, that the row was derived from the current root. The existing requirement "A re-derive that skipped any file is incomplete…" exists because a skipped file may leave a *stale row from the old root*; a quarantined path leaves **no** row, so it is not a skip in that sense (MODIFIED). Nor does it keep the scope due for a full-hash pass. Without both rules a single quarantined note re-arms whole-scope rewrites — #308 by another route.
+
+The entry is cleared when the note indexes successfully, when the file is deleted, or when the scope's index is discarded; it does not survive a process restart (a restart re-learns each poison note at the cost of one rolled-back attempt). One ERROR log per quarantine (path, SQLSTATE, no content).
+
+**One entrypoint.** Recovery and accounting live in `index_vault` itself (or a wrapper that every caller uses), so the **startup** pass (`indexer.py:6059,6086`), the **periodic** pass (`_index_pass_once`) and the panel's **Reindex now** (`control_panel/routes.py:2998,3022`) all get the same bounded restart and update D4's state. Startup backfill ordering and manual `full_hash` semantics are unchanged.
+
+### D4. Failure accounting and `/health`
+
+A module-level registry in `indexer.py` holds, per scope (`None` for single-user, `user_id` otherwise):
+
+- `index_consecutive_failures` — incremented when an index pass for the scope raises (after D3's bounded restarts), reset by a successful pass, from **every** entrypoint in both modes;
+- `embed_consecutive_failures` — incremented when a completed embed pass for the scope reports typed provider failures (`EmbedPassResult`, `indexer.py:280-293`), reset by an embed pass with none. A quarantine is **not** a failure of either kind;
+- `last_success_at`, `last_failure_at`.
+
+Plus two process-wide signals that are not per scope:
+
+- **indexer task not running** — set by `_on_indexer_done` (`main.py:405`) when the background task ends by exception or returns while the app is not shutting down; not set on lifespan cancellation, nor when indexing is disabled (`MCP_SANDBOX_MODE`), where `indexer.status` is `"disabled"`;
+- **enumeration failures** — consecutive failures of the loop's own per-tick work that is not attributable to a scope (user enumeration, overlap detection), counted like a scope.
+
+The CRITICAL "manual intervention required" log fires once when a counter first reaches `INDEXER_DEGRADED_AFTER_FAILURES` (default 3, replacing the hard-coded 5) and re-arms on reset.
 
 `/health` adds:
 
 ```json
-"indexer": {"status": "ok" | "degraded",
-            "failing_scopes": 0, "max_consecutive_failures": 0,
+"indexer": {"status": "ok" | "degraded" | "disabled",
+            "task_running": true,
+            "failing_scopes": 0, "embedding_failing_scopes": 0,
+            "max_consecutive_failures": 0,
             "quarantined_notes": 0, "last_success_at": "…" | null}
 ```
 
-and the top-level `status` becomes `"degraded"` when `failing_scopes > 0` (a scope at or over the threshold) or `quarantined_notes > 0`. It reads in-process state only — it never probes, consistent with the endpoint's docstring. **HTTP stays 200**: the Kubernetes manifests use `/health` for liveness, and a restart loop cannot repair vault content; operators monitor with a keyword/JSON check on `status`. **No paths, error text, SQLSTATEs or user ids** appear: `/health` is unauthenticated and routed publicly, and in multi-user mode a path would disclose another tenant's note names.
+and top-level `status` is `"degraded"` when the task is not running, any index/embedding/enumeration counter is at or over the threshold, or `quarantined_notes > 0`. In-process state only — it never probes. **HTTP stays 200**: the Kubernetes manifests use `/health` for liveness (`deploy/kubernetes/base/deployment.yaml:108-139`) and a restart loop cannot repair vault content or a provider outage; operators alert on the `status` field. **No paths, error text, SQLSTATEs or user ids**: `/health` is unauthenticated and publicly routed.
 
 ### D5. Surface the quarantine where the operator already looks
 
-The pass's `indexer_runs` row records the quarantine in its existing `error` column — `"quarantined N note(s): <path>, …"` (paths capped at 5, then `…`) — so the dashboard strip and health page already show it without a template change. A pass whose only anomaly is a quarantine still commits and still embeds; only the run record and `/health` carry the signal. The CRITICAL "manual intervention" wording is kept for the consecutive-failure case.
+The pass's `indexer_runs` row names quarantined paths in its `error` column — `"quarantined N note(s): <path>, …"` (≤ 5, then `…`) — so the dashboard strip and health page show it without a template change. D4's success/failure is **not** derived from that column (a quarantining pass is a successful pass).
 
 ### D6. Tests
 
-- The two NUL-fixture integration tests move to a synthetic floor failure (e.g. a monkeypatched `to_tsvector` call raising SQLSTATE 54000 for one note), and assert the new behaviour: the note quarantined, the other notes committed, the note's pre-existing row unchanged.
-- New real-Postgres tests: the #308 repro (`hello\x00world`) indexes and is keyword-searchable as `helloworld`; YAML `title: "a\0b"` indexes; a NUL-bearing note embeds (chunk text insert succeeds); a quarantined note is retried after an edit and indexes once fixed; `max retries` exceeded fails the pass.
-- Unit tests: `/health` shapes (ok, degraded by failures, degraded by quarantine, no path in body), multi-user failure counting, hash stability for NUL-free notes.
+- `tests/integration/test_tsvector_bounded_pg.py`: split the two NUL-fixture tests. The **incremental** one uses a genuine server-side floor failure on one note (a real PostgreSQL statement error, e.g. a temporary trigger raising `program_limit_exceeded` for that path — not a Python-raised exception, so transaction recovery is exercised) and asserts quarantine + the rest committed. The **full-rebuild** one (:249-273) keeps asserting whole-rebuild rollback and operator-visible failure, with the same synthetic trigger in place of NUL.
+- New real-Postgres tests: #308 repro indexes and is searchable as `helloworld`, and the next unchanged tick writes nothing; NUL note embeds; YAML `"a\0b"` title/tags/key; `[x](bad%00target.md)` produces no link and does not resolve to `badtarget.md`; poison in each attributable site (move over 1024 chars, upsert row, tsvector, link row) is quarantined while other notes commit, **after an earlier successful move in the same pass**; an already-indexed-and-embedded note whose edit becomes poison is **removed** from the index (not served stale by `semantic_search`/`keyword_search`); edit clears quarantine; a quarantine during a re-derive stamps provenance and the next tick re-upserts nothing; retry bound exceeded fails the pass; startup and manual-reindex entrypoints recover the same way.
+- Unit tests: `/health` shapes (ok; degraded by index failures, embedding failures, dead task, enumeration failures, quarantine; disabled; body contains no path or id), per-scope multi-user counting, CRITICAL-once.
 
 ## Risks / Trade-offs
 
-- [A quarantined new note is invisible to search until edited] → it is logged at ERROR, counted on `/health`, named in the run record; with D1/D2 no known input reaches this.
+- [A quarantined note — new or previously indexed — is absent from search until edited] → by design, rather than served stale; logged at ERROR, counted on `/health`, named in the run record; with D1/D2 no known input reaches this.
+- [Inbound links to a quarantined note lose resolution] → same as delete-and-recreate today; documented pre-existing limitation.
 - [Restart repeats up to N partial passes' writes when poison notes first appear] → bounded per tick; subsequent ticks exclude the note up front. Far below today's unbounded loop.
 - [A non-note-specific class-22 error mis-attributed to a row] → the per-row replay identifies a row only if that row fails alone; if no single row fails, the error is not a poison failure and the pass fails normally.
 - [NUL removal merges tokens: `a\0b` is searchable as `ab`] → declared behaviour; the file keeps its bytes.
