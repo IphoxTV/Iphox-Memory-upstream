@@ -62,30 +62,41 @@ The rebuild's snapshot SHALL therefore retain each row's owner, relative path an
 - **AND** the keyword index SHALL never be left half-built under two FTS configurations
 
 ### Requirement: A re-derive that skipped any file is incomplete, and an incomplete re-derive is not recorded
-Any per-file skip during a re-deriving pass SHALL make that re-derive **incomplete**, and an incomplete re-derive SHALL NOT record provenance for that user. A skip is any discovered file the pass did not fully process — a directory it could not open, a file it could not read, stat, decode or parse, or a changed note whose links it could not extract. A **quarantined** note (see "A note that fails at a per-note database boundary SHALL be quarantined and removed from the index") is NOT a skip: the pass read and hashed the file, and its row, links and embeddings are absent from the index by decision, so the pass leaves no row at that path that it did not derive — the foreign row this rule guards against cannot survive there. A note whose link extraction was **truncated at the declared cap** (`MAX_LINKS_PER_NOTE`) is NOT a skip either: the cap is a bounded, deterministic, logged degradation, the rows the pass wrote are exactly the rows it derived, and the note is marked `links_truncated` so the truncation is durably visible. An incomplete pass SHALL still perform every repair it can, SHALL log the paths that kept it unrecorded, and the next pass SHALL re-derive again.
+A per-file skip during a re-deriving pass SHALL make that re-derive **incomplete** when the skip could leave a row the pass did not derive, and an incomplete re-derive SHALL NOT record provenance for that user. Such a skip is: a discovered file the pass could not open, stat or read **whose path has a row** in the pass's locked snapshot; a directory it could not open or list (anything beneath it may have a row); or a changed note already selected for upsert whose links it could not extract. A skipped path with **no** row cannot certify a foreign row and SHALL NOT withhold the record. A path that is **present but not indexable** — a quarantined note, a file whose content is not valid UTF-8, or a path that cannot be encoded or exceeds the stored path length (see "Paths and contents the index can never hold are present but not indexable") — SHALL NOT withhold the record either, because any row at that path is deleted in the pass's transaction. A note whose link extraction was **truncated at the declared cap** (`MAX_LINKS_PER_NOTE`) is NOT a skip: the cap is a bounded, deterministic, logged degradation, the rows the pass wrote are exactly the rows it derived, and the note is marked `links_truncated` so the truncation is durably visible. An incomplete pass SHALL still perform every repair it can, SHALL log the paths that kept it unrecorded, and the next pass SHALL re-derive again.
 
-Without this rule the pass's structural claim is false. The scan continues past a file it cannot decode or read, and ordinary pruning keeps a row whose relative path exists under the assigned root — which is exactly the row a re-derive exists to replace. A vault that supplies a note at the same relative path as the previous vault, but whose bytes cannot be decoded, therefore leaves the previous vault's metadata row and its link rows untouched while the pass completes and records the new directory over them. One skipped file is enough to certify a foreign row.
+Without this rule the pass's structural claim is false. The scan continues past a file it cannot read, and ordinary pruning keeps a row whose relative path exists under the assigned root — which is exactly the row a re-derive exists to replace. A vault that supplies a note at the same relative path as the previous vault, but which cannot be read, therefore leaves the previous vault's metadata row and its link rows untouched while the pass completes and records the new directory over them. One such skip is enough to certify a foreign row.
 
-The rule fails toward re-work rather than toward wrongness, and that is the trade the system SHALL take. The alternative — transactionally deleting the stale rows for each skipped path, as a fresh index would — is a second deletion path for index contents, and it destroys a row that may be the correct row for a file that was merely unreadable at that moment.
+The rule fails toward re-work rather than toward wrongness for an unreadable file, because the alternative — deleting the row behind every unreadable path — destroys a row that may be the correct row for a file that was merely unreadable at that moment. A file whose bytes were read in full but are not valid UTF-8 is not in that position: its bytes are provably not those the row was derived from, so its row is deleted rather than kept.
 
-The system SHALL accept, and document, that a file which is permanently unreadable keeps that user in re-derive mode indefinitely. That is preferable to the alternative, which is recording a claim the pass could not establish: the record would then license the keep branch over rows the pass never visited. The cost is bounded — a re-derive parses and upserts a vault the pass already reads in full and makes no embedding call for unchanged content — and it SHALL be operator-visible: the pass SHALL name the offending paths in its log on every pass, so the file to fix is identified rather than left as an unexplained recurring cost. A capped note, by contrast, does not keep the user in re-derive mode: it is complete by construction and its degradation is carried on the row, not in the pass's skip list.
+A re-derive re-runs every tick until it completes, and each re-run upserts every file with its keyword vector and links, so an incomplete re-derive is a full-scope rewrite per tick. It SHALL therefore be withheld only by a skip that could hide a foreign row, as above, and a scope whose re-derive stays incomplete for `INDEXER_DEGRADED_AFTER_FAILURES` consecutive passes SHALL be counted as degraded (see the failure-accounting requirement), in addition to the pass naming the offending paths in its log.
 
-#### Scenario: An undecodable file withholds the record
+#### Scenario: An unreadable file with a row behind it withholds the record
 
-- **WHEN** a re-deriving pass discovers a file it cannot decode and completes the rest of its work
+- **WHEN** a re-deriving pass discovers a file it cannot read, the locked snapshot has a row at that path, and the pass completes the rest of its work
 - **THEN** the pass SHALL record no provenance for that user
 - **AND** the next pass SHALL re-derive again
 
-#### Scenario: A foreign row behind a skipped path is never certified
+#### Scenario: An unreadable file with no row does not withhold the record
 
-- **WHEN** a user was indexed from one vault, is assigned another, and the newly assigned vault holds a file at the same relative path whose bytes cannot be decoded
-- **THEN** the pass SHALL NOT record the newly assigned root's provenance
-- **AND** a later pass SHALL NOT take the keep branch over the row that path still carries
+- **WHEN** a re-deriving pass discovers a file it cannot read, no row exists at that path, and nothing else is skipped
+- **THEN** the pass SHALL record the provenance of the directory it scanned
+- **AND** the next tick SHALL NOT re-derive or re-upsert the scope's unchanged notes
 
-#### Scenario: A file that disappears during the scan withholds the record
+#### Scenario: A foreign row behind an undecodable path is deleted, not certified
+
+- **WHEN** a user was indexed from one vault, is assigned another, and the newly assigned vault holds a file at the same relative path whose bytes are not valid UTF-8
+- **THEN** the pass SHALL delete the previous vault's row at that path, with its embeddings and outgoing links, in its transaction
+- **AND** if nothing else withholds the record it SHALL record the newly assigned root's provenance, and no later pass SHALL take the keep branch over a row from the previous vault at that path
+
+#### Scenario: A file that disappears during the scan withholds the record only if it has a row
 
 - **WHEN** a file is discovered by a re-deriving pass and can no longer be read when the pass reaches it
-- **THEN** the pass SHALL treat that path as a skip and SHALL record no provenance for that user
+- **THEN** the pass SHALL treat that path as a skip, and SHALL record no provenance for that user if the locked snapshot has a row at that path
+
+#### Scenario: A directory that cannot be listed withholds the record
+
+- **WHEN** a re-deriving pass cannot open or list a directory beneath the root
+- **THEN** the pass SHALL record no provenance for that user
 
 #### Scenario: Every link-extraction skip is recorded, including the unreachable one
 
@@ -98,6 +109,12 @@ The system SHALL accept, and document, that a file which is permanently unreadab
 - **WHEN** a re-deriving pass reaches a changed note with more than `MAX_LINKS_PER_NOTE` links and processes every other discovered file without a skip
 - **THEN** the first `MAX_LINKS_PER_NOTE` links SHALL be written, `links_truncated` SHALL be set on the note, an ERROR line SHALL be logged, and the pass SHALL record the provenance of the directory it scanned
 
+#### Scenario: A quarantined note does not withhold the record, and leaves no foreign row
+
+- **WHEN** a user was indexed from one vault, is assigned another, and a re-deriving pass quarantines the newly assigned vault's note at a relative path the previous vault also had
+- **THEN** the row at that path from the previous vault SHALL be deleted in the pass's transaction, together with its embeddings and outgoing links
+- **AND** if the pass has no other withholding skip it SHALL record the provenance of the directory it scanned, and the next tick SHALL NOT re-derive or re-upsert the scope's unchanged notes
+
 #### Scenario: The skipped paths are named
 
 - **WHEN** a re-deriving pass is incomplete
@@ -105,21 +122,14 @@ The system SHALL accept, and document, that a file which is permanently unreadab
 
 #### Scenario: A complete re-derive is recorded
 
-- **WHEN** a re-deriving pass processes every discovered file without a skip and raises nothing
+- **WHEN** a re-deriving pass leaves no withholding skip and raises nothing
 - **THEN** it SHALL record the provenance of the directory it scanned, after its last write
-
-#### Scenario: A quarantined note does not withhold the record, and leaves no foreign row
-
-- **WHEN** a user was indexed from one vault, is assigned another, and a re-deriving pass quarantines the newly assigned vault's note at a relative path the previous vault also had
-- **THEN** the row at that path from the previous vault SHALL be deleted in the pass's transaction, together with its embeddings and outgoing links
-- **AND** if the pass has no other skip it SHALL record the provenance of the directory it scanned, and the next tick SHALL NOT re-derive or re-upsert the scope's unchanged notes
-
 
 ## ADDED Requirements
 
 ### Requirement: The indexer SHALL derive every indexed value from NUL-free text and SHALL NOT modify the note file
 
-The indexer SHALL remove every U+0000 character from a note's text at the single point where the file's bytes are decoded, before the content hash is computed, so that the content hash, the keyword vector, the title, tags, links, chunk text and every re-verification by the embed, reconciliation, link-backfill and rebuild passes are derived from the same NUL-free text. A note containing no NUL SHALL produce exactly the text and content hash it produced before this change. The indexer SHALL additionally remove U+0000 from every string key and value written to the `frontmatter` JSONB column, and the shared title and tag derivations (used by the indexer, `read_note` metadata and `move_note` alike) SHALL remove it from their results, because a YAML escape can produce a NUL from NUL-free bytes. The note's bytes on disk SHALL NOT be modified, and the parsed frontmatter mapping used by `set_frontmatter` SHALL NOT be altered. A link whose decoded target, anchor or alias contains U+0000 SHALL NOT be extracted as a link, because removing the character would name a different file. Each read that removes a NUL SHALL log one WARNING naming the vault-relative path and the number removed, and SHALL NOT log note content.
+The indexer SHALL remove every U+0000 character from a note's text at the single point where the file's bytes are decoded, before the content hash is computed, so that the content hash, the keyword vector, the title, tags, links, chunk text and every re-verification by the embed, reconciliation, link-backfill and rebuild passes are derived from the same NUL-free text. A note containing no NUL SHALL produce exactly the text and content hash it produced before this change. The indexer SHALL additionally remove U+0000 from every string key and value written to the `frontmatter` JSONB column, and the shared title and tag derivations (used by the indexer, `read_note` metadata and `move_note` alike) SHALL remove it from their results, because a YAML escape can produce a NUL from NUL-free bytes. The note's bytes on disk SHALL NOT be modified, and the parsed frontmatter mapping used by `set_frontmatter` SHALL NOT be altered. The shared tag derivation SHALL drop, with a WARNING, any tag whose UTF-8 encoding exceeds 1,024 bytes, so one tag cannot exceed the tags index's row limit. A link whose decoded target, anchor or alias contains U+0000 SHALL NOT be extracted as a link, because removing the character would name a different file. Each read that removes a NUL SHALL log one WARNING naming the vault-relative path and the number removed, and SHALL NOT log note content.
 
 #### Scenario: A note with a NUL in its body indexes (#308 repro)
 
@@ -137,6 +147,11 @@ The indexer SHALL remove every U+0000 character from a note's text at the single
 - **WHEN** a note's frontmatter contains `title: "a\0b"` and `tags: ["x\0y"]` and a key `"k\0": 1`
 - **THEN** the pass SHALL complete, the stored title SHALL be `ab`, the stored tags SHALL include `xy`, and the stored JSONB SHALL carry the key `k`
 
+#### Scenario: An over-long tag is dropped, not fatal
+
+- **WHEN** a note's frontmatter carries a 3,000-byte tag and an ordinary tag
+- **THEN** the note SHALL index with the ordinary tag only
+
 #### Scenario: A percent-encoded NUL in a link target does not invent a link
 
 - **WHEN** a note contains `[x](bad%00target.md)` and a note `badtarget.md` exists
@@ -149,9 +164,9 @@ The indexer SHALL remove every U+0000 character from a note's text at the single
 
 ### Requirement: A note that fails at a per-note database boundary SHALL be quarantined and removed from the index
 
-A **poison failure** SHALL be a database error whose SQLSTATE is in class 22 (data exception) or is 54000 (program limit exceeded), raised during an incremental index pass by a write attributable to exactly one note: its id-preserving move update, its row in the batch upsert, its keyword-vector build failing at the floor, or its link inserts. Each of these write sites SHALL run inside a savepoint so that a failure leaves the pass's transaction usable; a batch statement that fails with a poison SQLSTATE SHALL be replayed one row at a time, each row in its own savepoint, to identify the note, and if no single row fails alone the error SHALL NOT be treated as a poison failure.
+A **poison failure** SHALL be a database error whose SQLSTATE is in class 22 (data exception) or is 54000 (program limit exceeded), raised during an incremental index pass by a write attributable to exactly one note: its id-preserving move update, its row in the batch upsert, its keyword-vector build failing at the floor, or its link inserts. Each of these write sites SHALL run inside a savepoint so that a failure leaves the pass's transaction usable; a batch statement that fails with a poison SQLSTATE SHALL be replayed one row at a time, each row in its own savepoint, to identify the note, **every** row that fails alone SHALL be quarantined in the same restart, and if no single row fails alone the error SHALL NOT be treated as a poison failure.
 
-On a poison failure the pass's transaction SHALL roll back in full, the note SHALL be recorded in an in-process quarantine keyed by owner and vault-relative path together with the content hash that failed, and the pass SHALL be re-run for the same scope from classification, at most `INDEXER_QUARANTINE_RETRIES_PER_TICK` times per scope per invocation; beyond that bound the pass SHALL fail as an ordinary failure. While a file's current content hash equals its quarantined hash, every pass SHALL treat it as present on disk but not indexable: it SHALL be excluded from upsert and from move detection, and any existing row at that path SHALL be deleted in the pass's transaction together with its embeddings and outgoing links, so that no search tool serves the note's superseded content and no committed content hash is paired with derived data from other content. A quarantine SHALL NOT count as a read failure: it SHALL NOT keep the scope due for a full-hash pass. The entry SHALL be cleared when the note next indexes successfully, when its file is deleted, or when its scope's index is discarded. Quarantining SHALL log one ERROR naming the path and SQLSTATE and no content, and the pass's run record SHALL name the quarantined paths (at most five, then an ellipsis) in its error field without the pass counting as failed. The startup pass, the periodic pass and the panel's manual reindex SHALL all apply this recovery. The full keyword rebuild is excluded from this requirement and SHALL remain atomic.
+On a poison failure the pass's transaction SHALL roll back in full, the note SHALL be recorded in an in-process quarantine keyed by owner and vault-relative path together with the content hash that failed, and the pass SHALL be re-run for the same scope from classification, at most `INDEXER_QUARANTINE_RETRIES_PER_TICK` times per scope per invocation; beyond that bound the pass SHALL fail as an ordinary failure. While a file's current content hash equals its quarantined hash, every pass SHALL treat it as present on disk but not indexable: it SHALL be excluded from upsert and from move detection, and any existing row at that path SHALL be deleted in the pass's transaction together with its embeddings and outgoing links, so that no search tool serves the note's superseded content and no committed content hash is paired with derived data from other content. A quarantine SHALL NOT count as a read failure: it SHALL NOT keep the scope due for a full-hash pass. The entry SHALL be cleared when the note next indexes successfully, when its file is deleted, or when its scope's index is discarded. Quarantining SHALL log one ERROR naming the path and SQLSTATE and no content, and the pass's run record SHALL name the quarantined paths (at most five, then an ellipsis, each rendered so that an unencodable character cannot make the record itself unstorable) in its error field without the pass counting as failed. The startup pass, the periodic pass and the panel's manual reindex SHALL all apply this recovery. The full keyword rebuild is excluded from this requirement and SHALL remain atomic.
 
 #### Scenario: One poison note does not stop its owner's index
 
@@ -192,7 +207,7 @@ On a poison failure the pass's transaction SHALL roll back in full, the note SHA
 
 ### Requirement: Indexer failures SHALL be counted per scope from every entrypoint, together with embedding failures and loss of the indexer task
 
-The indexer SHALL keep, per scope, the number of consecutive failed index passes and the number of consecutive embed passes that reported provider failures, with the time of the last success and last failure, updated identically by the startup, periodic and manual-reindex entrypoints in single-user and multi-user modes. An index pass SHALL count as failed only if it raises after the quarantine recovery; a pass that quarantines a note SHALL count as successful. A successful pass (respectively an embed pass with no provider failure) SHALL reset its counter. Per-tick work not attributable to one scope — user enumeration and overlap detection — SHALL be counted as its own consecutive-failure counter. The application SHALL record that the indexer background task is not running when that task ends by exception or returns while the application is not shutting down. The CRITICAL "manual intervention required" log SHALL be emitted once when any counter first reaches `INDEXER_DEGRADED_AFTER_FAILURES` (default 3), and not again for that counter until it has been reset.
+The indexer SHALL keep, per scope, the number of consecutive failed index passes and the number of consecutive embed passes that reported provider failures, with the time of the last success and last failure, updated identically by the startup, periodic and manual-reindex entrypoints in single-user and multi-user modes. An index pass SHALL count as failed only if it raises after the quarantine recovery; a pass that quarantines a note SHALL count as successful. A successful pass (respectively an embed pass with no provider failure) SHALL reset its counter. Per-tick work not attributable to one scope — user enumeration and overlap detection — SHALL be counted as its own consecutive-failure counter. The application SHALL record that the indexer background task is not running when that task ends by exception or returns while the application is not shutting down. A scope whose re-derive stays incomplete SHALL be counted in the same way. In single-user mode a failed index stage SHALL NOT prevent the same tick's embed stage from running over committed rows, nor the token, authorization-code and unused-client cleanup, which SHALL run on every tick regardless of the index outcome. The CRITICAL "manual intervention required" log SHALL be emitted once when any counter first reaches `INDEXER_DEGRADED_AFTER_FAILURES` (default 3), and not again for that counter until it has been reset.
 
 #### Scenario: A failing tenant is counted in multi-user mode
 
@@ -204,8 +219,38 @@ The indexer SHALL keep, per scope, the number of consecutive failed index passes
 - **WHEN** metadata indexing succeeds on three consecutive ticks while every embedding request fails
 - **THEN** the scope's embedding failure count SHALL be 3 and its index failure count SHALL be 0
 
+#### Scenario: A single-user index failure does not stop embedding or cleanup
+
+- **WHEN** in single-user mode the index stage fails on a tick
+- **THEN** the embed stage and the expired-token and unused-client cleanup SHALL still run on that tick
+
 #### Scenario: A dead indexer task is recorded
 
 - **WHEN** the indexer background task raises during startup user enumeration and ends while the HTTP application keeps serving
 - **THEN** the indexer SHALL be recorded as not running
 - **AND** a lifespan shutdown that cancels the task SHALL NOT record it as not running
+
+### Requirement: Paths and contents the index can never hold SHALL be present but not indexable, decided at the scan
+
+The scan (and the locked re-read) SHALL classify as **present but not indexable** a discovered file whose vault-relative path cannot be encoded as UTF-8 or exceeds the stored path length, and a file whose bytes were read in full but are not valid UTF-8. Such a path SHALL NOT be upserted, SHALL NOT take part in move detection, and any existing row at that path SHALL be deleted in the pass's transaction together with its embeddings and outgoing links, so no search tool serves content the file no longer holds. Each SHALL be logged at WARNING with the path rendered so that it can always be logged and stored, and SHALL NOT cause the pass to fail, to restart, or to withhold a re-derive's record. A file that cannot be opened, statted or read SHALL NOT be classified this way: its row, if any, SHALL be kept as before.
+
+#### Scenario: A filename that is not valid UTF-8 does not wedge the pass
+
+- **WHEN** the vault contains `caf\xe9.md` (a Latin-1 byte in the name) beside 100 ordinary changed notes
+- **THEN** the pass SHALL commit the 100 notes, write no row for that file, log one WARNING, and the next tick SHALL NOT repeat any write
+
+#### Scenario: An over-long path does not wedge the pass
+
+- **WHEN** a note sits at a path longer than the `file_path` column allows
+- **THEN** the pass SHALL skip it at the scan, commit every other note, and SHALL NOT restart
+
+#### Scenario: A note rewritten as non-UTF-8 is removed, not served stale
+
+- **WHEN** an indexed and embedded note is overwritten with Latin-1 bytes
+- **THEN** after the next pass it SHALL have no row, keyword vector, embeddings or outgoing links, and neither search tool SHALL return its previous content
+
+#### Scenario: An unreadable file keeps its row
+
+- **WHEN** an indexed note becomes unreadable (permission denied)
+- **THEN** its row SHALL be kept unchanged, as before this change
+

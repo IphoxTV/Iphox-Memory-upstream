@@ -25,9 +25,18 @@
 - [ ] 3.4 `/health`: `indexer` object and `degraded` top-level status per spec; HTTP 200; no paths/errors/ids; update docstring
 - [ ] 3.5 Unit tests: ok; degraded by index failures / embedding failures / dead task / enumeration failures / quarantine; disabled; multi-user counting; CRITICAL-once; body contains no path or id
 
+## 3b. Bug-hunt folds (D7, D8, D9, D2 tag bound)
+
+- [ ] 3b.1 Scan + C4 re-read: unencodable or > `MAX_PATH_CHARS` rel, and `UnicodeDecodeError` content → "present but not indexable": excluded from `to_upsert`/move pairing, existing row deleted via the ordinary delete path, WARNING with `backslashreplace`; EACCES/EIO/ENOENT unchanged (row kept)
+- [ ] 3b.2 Re-derive stamp: withhold only for a skip with a locked row, a directory walk failure, or a skip on a path in `to_upsert`; incomplete re-derive counted by D4
+- [ ] 3b.3 Batch replay quarantines every row that fails alone in one restart; run-record paths rendered with `backslashreplace`
+- [ ] 3b.4 `vault.extract_tags`: drop tags > 1,024 UTF-8 bytes with a WARNING
+- [ ] 3b.5 Single-user loop: index stage caught on its own; embed still runs; `cleanup_expired_tokens` in the tick's `finally`, own `try`
+- [ ] 3b.6 Tests per design D6 "Bug-hunt tests"
+
 ## 4. Docs
 
-- [ ] 4.1 `docs/architecture/indexing-and-embeddings.md`: NUL rule, quarantine rule, revised floor-failure bullet, "a quarantine is not a read failure"
+- [ ] 4.1 `docs/architecture/indexing-and-embeddings.md`: NUL rule, quarantine rule, revised floor-failure bullet, "a quarantine is not a read failure", D7 not-indexable rule, D8 re-derive stamp rule (and fix the stale "reads in full" rationale), `vault-tools.md` tag bound
 - [ ] 4.2 `DEPLOYMENT.md` / `README.md`: monitor `/health` `status` by keyword, not status code; new settings
 - [ ] 4.3 `CLAUDE.md` key-decisions line for the quarantine and `/health` degraded
 

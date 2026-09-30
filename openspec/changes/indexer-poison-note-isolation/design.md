@@ -46,6 +46,7 @@ Constraints carried from `docs/architecture/indexing-and-embeddings.md` that thi
 YAML `"\0"` produces a NUL from NUL-free bytes, so D1 does not cover frontmatter.
 
 - **Title and tags — shared normalization.** `vault.note_title` and `vault.extract_tags` are the one derivation used by the indexer (`_note_title` wraps the former), `read_note`'s metadata (`vault.py:2079-2080`) and `move_note` (`tools.py:5281,5337`). NUL is removed inside those two shared functions, so every surface shows the same title and tags — the #154 "one title rule" extended, not forked. Raw note content and the parsed frontmatter mapping returned by `read_note` / re-serialised by `set_frontmatter` are **not** touched.
+- **Tag length.** `extract_tags` drops any tag (frontmatter or inline) whose UTF-8 encoding exceeds 1,024 bytes, logged at WARNING. `tags` has a GIN index, and a key over ~2.7 KB raises 54000 (`index row size exceeds maximum`), which would otherwise quarantine a whole note for one tag.
 - **JSONB.** `_jsonb_value` removes NUL from every string key and value on its existing walk (same boundary #154 uses; first-key-wins collision rule unchanged).
 - **Link targets.** Markdown hrefs are percent-decoded (`links.py:754`), so `[x](bad%00target.md)` yields a NUL from NUL-free text. Removing the NUL would *invent* a link to `badtarget.md`, a different file. A link whose decoded target, anchor or alias contains U+0000 is therefore **not a link**: the extractor drops it, exactly as it drops an empty href. Same for wikilink parts (the regex at `links.py:75` admits NUL; after D1 the body has none, but the rule is stated at the extractor so it holds for any input).
 
@@ -58,7 +59,7 @@ YAML `"\0"` produces a NUL from NUL-free bytes, so D1 does not cover frontmatter
 3. the **keyword-vector** build failing at its floor;
 4. the note's **link** inserts.
 
-Each site runs inside a savepoint (`async with session.begin_nested()`, `try` *outside* the context, as `write_tsvector_bounded` already does), so a failure leaves the outer transaction usable. A batch statement (upsert, links) that fails with a poison SQLSTATE is replayed one row at a time, each row in its own savepoint, to find the offending note; if no single row fails alone, the error is not a poison failure and is re-raised. The rebuild (`rebuild_tsvectors`) is excluded and stays atomic.
+Each site runs inside a savepoint (`async with session.begin_nested()`, `try` *outside* the context, as `write_tsvector_bounded` already does), so a failure leaves the outer transaction usable. A batch statement (upsert, links) that fails with a poison SQLSTATE is replayed one row at a time, each row in its own savepoint, to find the offending note; if no single row fails alone, the error is not a poison failure and is re-raised. **Every** row of the batch that fails alone is quarantined in the same restart, not just the first, so a folder of N bad notes costs one restart, not N/5 ticks. The rebuild (`rebuild_tsvectors`) is excluded and stays atomic.
 
 **Restart, not repair-in-place.** Once the offending note is identified the pass raises `PoisonNote(owner, rel_path, content_hash, sqlstate)`; the whole transaction rolls back and the pass is re-run **from classification** (moves included), with the note in the quarantine. Repairing in place would leave move bookkeeping (`moved_new_paths`, the `to_upsert` exclusions at `indexer.py:2594-2612`) describing writes that were undone. At most `INDEXER_QUARANTINE_RETRIES_PER_TICK` (default 5) restarts per scope per invocation; beyond that the pass fails as today and counts toward D4.
 
@@ -103,12 +104,35 @@ and top-level `status` is `"degraded"` when the task is not running, any index/e
 
 ### D5. Surface the quarantine where the operator already looks
 
-The pass's `indexer_runs` row names quarantined paths in its `error` column — `"quarantined N note(s): <path>, …"` (≤ 5, then `…`) — so the dashboard strip and health page show it without a template change. D4's success/failure is **not** derived from that column (a quarantining pass is a successful pass).
+The pass's `indexer_runs` row names quarantined paths in its `error` column — `"quarantined N note(s): <path>, …"` (≤ 5, then `…`), each rendered with `backslashreplace` so a path can never itself be unstorable — so the dashboard strip and health page show it without a template change. D4's success/failure is **not** derived from that column (a quarantining pass is a successful pass).
+
+### D7. Paths and contents the database can never hold are "present but not indexable", decided at the scan (bug hunt)
+
+The bug hunt (below) found three inputs that D1–D3 as first written either missed or handled expensively:
+
+- **A filename that is not valid UTF-8.** `os.scandir` on an fd yields a surrogate-escaped `str` (`caf\udce9.md`); asyncpg cannot encode it and raises a *client-side* `DataError` (SQLSTATE `22000` / or none after SQLAlchemy's wrapping) at the first bind — the move UPDATE or the batch upsert — so today it wedges the pass exactly like #308. The codebase already knows this (`encode_realpath`, #91) but the scan never checks.
+- **A path longer than `file_path` allows** (1,024) — 22001 at the same sites.
+- **A note rewritten with non-UTF-8 content.** `_scan_vault` adds the path to `seen` before the read, so on `UnicodeDecodeError` the existing row is neither upserted nor pruned and `semantic_search` keeps serving the old content as current — contradicting D3's premise that an unindexable note is absent. Plausible without an adversary: `write_file` with base64 or `import_from_url` of a Latin-1 page onto an existing `.md`.
+
+All three are decided **at the scan**, before any write, and treated like a quarantined note: **present on disk, not indexable, any existing row at that path deleted** (with embeddings and outgoing links) through the ordinary delete path, excluded from `to_upsert` and move pairing, logged at WARNING with the path rendered via `backslashreplace`. The scan checks `vault.is_encodable(rel)` and `len(rel) <= MAX_PATH_CHARS`; the C4 locked re-read applies the same checks. D3 remains the backstop for anything not predictable at the scan.
+
+This is deliberately **not** extended to a file that cannot be *read* (EACCES, EIO, a dangling symlink): for those the existing decision stands — the row may be correct for a file merely unreadable at that moment, so it is kept (index-integrity spec, the re-derive requirement). A decode failure is different because the bytes *were* read and are provably not the bytes the row was derived from.
+
+### D8. A skip withholds the re-derive stamp only if it could hide a foreign row (bug hunt)
+
+Today any skip withholds the provenance stamp, and a re-derive re-runs every tick until one completes — forcing every file into `to_upsert` (`indexer.py:2210,2367`) with a keyword-vector UPDATE and link rebuild each. One unreadable file with no row behind it therefore commits a **full-scope rewrite every tick, indefinitely** — #308's write amplification by a route the spec currently *accepts*, on a rationale ("a vault the pass already reads in full") the stat shortcut (#282) has since made false.
+
+The requirement exists to stop a skipped path from certifying a **foreign row**. A skip can hide one only if a row exists at that path. So the stamp SHALL be withheld only by: a skipped path that has a row in the locked snapshot; a directory walk failure (anything beneath it could have one); or a skip on a path already in `to_upsert` (buffered-body / link skips). A read skip on a path with no row, and every D7 "not indexable" path and D3 quarantine (whose rows are deleted), do not withhold. A scope that stays incomplete for `INDEXER_DEGRADED_AFTER_FAILURES` consecutive passes is counted by D4 and reported degraded, replacing "log the paths on every pass" as the only signal.
+
+### D9. Single-user tick isolation (bug hunt)
+
+In single-user mode an index failure currently jumps past `embed_vault`, cache prewarm and `cleanup_expired_tokens` (`indexer.py:6159-6178`) — the only caller of the token, code and unused-OAuth-client sweeps. D4 already rewrites this loop: the index stage is caught on its own (recorded for D4), and the embed stage still runs over already-committed rows; `cleanup_expired_tokens` moves to the tick's `finally` beside `flush_expired`, in its own `try`. This mirrors the multi-user `_index_pass_once`.
 
 ### D6. Tests
 
 - `tests/integration/test_tsvector_bounded_pg.py`: split the two NUL-fixture tests. The **incremental** one uses a genuine server-side floor failure on one note (a real PostgreSQL statement error, e.g. a temporary trigger raising `program_limit_exceeded` for that path — not a Python-raised exception, so transaction recovery is exercised) and asserts quarantine + the rest committed. The **full-rebuild** one (:249-273) keeps asserting whole-rebuild rollback and operator-visible failure, with the same synthetic trigger in place of NUL.
 - New real-Postgres tests: #308 repro indexes and is searchable as `helloworld`, and the next unchanged tick writes nothing; NUL note embeds; YAML `"a\0b"` title/tags/key; `[x](bad%00target.md)` produces no link and does not resolve to `badtarget.md`; poison in each attributable site (move over 1024 chars, upsert row, tsvector, link row) is quarantined while other notes commit, **after an earlier successful move in the same pass**; an already-indexed-and-embedded note whose edit becomes poison is **removed** from the index (not served stale by `semantic_search`/`keyword_search`); edit clears quarantine; a quarantine during a re-derive stamps provenance and the next tick re-upserts nothing; retry bound exceeded fails the pass; startup and manual-reindex entrypoints recover the same way.
+- Bug-hunt tests: a non-UTF-8 filename and a > 1,024-char path are skipped at the scan and the rest commits; an indexed note rewritten as Latin-1 is removed (not served stale); a re-derive with one unreadable row-less file stamps and the next tick re-upserts nothing, while a re-derive with an unreadable file that *has* a row does not stamp; a 3 KB tag is dropped and the note indexes; a batch with three poison rows quarantines all three in one restart; a single-user index failure still runs the embed stage and the token sweep.
 - Unit tests: `/health` shapes (ok; degraded by index failures, embedding failures, dead task, enumeration failures, quarantine; disabled; body contains no path or id), per-scope multi-user counting, CRITICAL-once.
 
 ## Risks / Trade-offs
@@ -123,6 +147,10 @@ The pass's `indexer_runs` row names quarantined paths in its `error` column — 
 ## Migration Plan
 
 No schema change. Deploy normally. On first pass after deploy, NUL-free notes keep their hashes (no re-index); a previously wedged scope completes its pass, which is one full write of the backlog, then returns to incremental. Rollback: redeploy the previous image — behaviour returns to the pre-change abort.
+
+## Bug hunt (2026-09-30) — disposition
+
+An 8-agent read-only hunt (4 bug classes, each finding independently verified and triaged) ran against this spec. Folded in: D7 (non-UTF-8 filename — HIGH, found by two hunters independently; over-long path; non-UTF-8 content served stale — MEDIUM), D8 (re-derive rewrite loop — MEDIUM), D9 (single-user tick isolation — LOW), D2 tag bound (LOW), D3 all-failing-rows-per-restart, D5 path rendering. Filed separately: an unlistable directory or an empty-but-mounted root prunes the scope's rows and embeddings on a "clean" run (HIGH — a different class, a wrong prune, with its own spec change); NUL / surrogate / NaN in logged tool arguments loses the `usage_logs` row and the rate-refusal coalescer requeues the unstorable template every tick (LOW). Declined per triage: a FIFO or `/dev/zero` symlink or hung NFS mount blocking the scan (no plausible input on this host; `INDEX_STAT_SHORTCUT=false` guidance already covers network mounts); a permanently unreadable file keeping full-hash passes due (reads, not writes; bounded by D8); NUL in search/filter arguments returning a tool error (correct refusal, no state); OAuth endpoints 500 on NUL `client_id` (no state, unauthenticated caller only harms itself).
 
 ## Open Questions
 
