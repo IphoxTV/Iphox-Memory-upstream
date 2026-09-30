@@ -179,9 +179,9 @@ On a poison failure the pass's transaction SHALL roll back in full, the note SHA
 - **WHEN** one row of a 100-row upsert batch raises a class-22 error
 - **THEN** the pass SHALL identify that row by per-row replay, quarantine it, and commit the other 99
 
-#### Scenario: A move to an over-long path is quarantined
+#### Scenario: A poison failure on a move is quarantined
 
-- **WHEN** an indexed note is moved on disk to a path longer than the `file_path` column allows, with its content unchanged
+- **WHEN** an indexed note is moved on disk to a valid-length path and the id-preserving move update raises a genuine server-side poison failure
 - **THEN** the destination SHALL be quarantined, the source row SHALL be deleted as for a vanished file, and every other note in the scope SHALL be committed
 
 #### Scenario: A previously indexed note that becomes poison is removed, not served stale
@@ -202,12 +202,12 @@ On a poison failure the pass's transaction SHALL roll back in full, the note SHA
 
 #### Scenario: The retry bound is honoured
 
-- **WHEN** more poison failures occur in one scope in one invocation than `INDEXER_QUARANTINE_RETRIES_PER_TICK`
+- **WHEN** recovering one scope in one invocation would require more restarts than `INDEXER_QUARANTINE_RETRIES_PER_TICK`
 - **THEN** that invocation SHALL fail with nothing committed for its last attempt and the failure SHALL count toward the scope's consecutive failures, while the notes already quarantined stay quarantined for the next tick
 
 ### Requirement: Indexer failures SHALL be counted per scope from every entrypoint, together with embedding failures and loss of the indexer task
 
-The indexer SHALL keep, per scope, the number of consecutive failed index passes and the number of consecutive embed passes that reported provider failures, with the time of the last success and last failure, updated identically by the startup, periodic and manual-reindex entrypoints in single-user and multi-user modes. An index pass SHALL count as failed only if it raises after the quarantine recovery; a pass that quarantines a note SHALL count as successful. A successful pass (respectively an embed pass with no provider failure) SHALL reset its counter. Per-tick work not attributable to one scope — user enumeration and overlap detection — SHALL be counted as its own consecutive-failure counter. The application SHALL record that the indexer background task is not running when that task ends by exception or returns while the application is not shutting down. A scope whose re-derive stays incomplete SHALL be counted in the same way. In single-user mode a failed index stage SHALL NOT prevent the same tick's embed stage from running over committed rows, nor the token, authorization-code and unused-client cleanup, which SHALL run on every tick regardless of the index outcome. The CRITICAL "manual intervention required" log SHALL be emitted once when any counter first reaches `INDEXER_DEGRADED_AFTER_FAILURES` (default 3), and not again for that counter until it has been reset.
+The indexer SHALL keep, per scope, the number of consecutive failed index passes and the number of consecutive embed passes that reported provider failures, with the time of the last success and last failure, updated identically by the startup, periodic and manual-reindex entrypoints in single-user and multi-user modes. An index pass SHALL count as failed only if it raises after the quarantine recovery; a pass that quarantines a note SHALL count as successful. A successful pass (respectively an embed pass with no provider failure) SHALL reset its counter. Per-tick work not attributable to one scope — user enumeration and overlap detection — SHALL be counted as its own consecutive-failure counter. The application SHALL record that the indexer background task is not running when that task ends by exception or returns while the application is not shutting down. A committed re-derive that is incomplete SHALL increment a separate per-scope `rederive_incomplete` counter, reset by a re-derive that records provenance or by the scope leaving re-derive; it SHALL count toward degradation like the other counters. In single-user mode a failed index stage SHALL NOT prevent the same tick's embed stage from running over committed rows, nor the token, authorization-code and unused-client cleanup, which SHALL run on every tick regardless of the index outcome. The CRITICAL "manual intervention required" log SHALL be emitted once when any counter first reaches `INDEXER_DEGRADED_AFTER_FAILURES` (default 3), and not again for that counter until it has been reset.
 
 #### Scenario: A failing tenant is counted in multi-user mode
 

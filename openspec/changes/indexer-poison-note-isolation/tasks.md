@@ -15,11 +15,11 @@
 - [ ] 2.5 Classification: a file whose hash equals its quarantined hash is excluded from upsert and move detection; any existing row at that path is deleted (with embeddings and outgoing links) through the ordinary delete path; not a read failure, not a re-derive skip, does not keep the scope due
 - [ ] 2.6 Run record `error` names quarantined paths (≤ 5, then `…`) without the pass counting as failed; one ERROR log per quarantine
 - [ ] 2.7 `tests/integration/test_tsvector_bounded_pg.py`: incremental NUL-fixture test → genuine server-side floor failure (temporary trigger) asserting quarantine + rest committed; full-rebuild test (:249-273) keeps whole-rebuild rollback with the synthetic trigger
-- [ ] 2.8 Integration tests (real Postgres), per design D6: #308 repro + next tick writes nothing; NUL note embeds; each attributable site (move > 1024 chars, upsert row, tsvector, link row) after an earlier successful move; indexed+embedded note turned poison is removed, not served stale by either search tool; edit clears quarantine; re-derive with quarantine stamps provenance and next tick re-upserts nothing; retry bound; startup and manual reindex entrypoints
+- [ ] 2.8 Integration tests (real Postgres), per design D6: #308 repro + next tick writes nothing; NUL note embeds; each attributable site (server-side failure on a valid-length move, upsert row, tsvector, link row) after an earlier successful move; indexed+embedded note turned poison is removed, not served stale by either search tool; edit clears quarantine; re-derive with quarantine stamps provenance and next tick re-upserts nothing; retry bound; startup and manual reindex entrypoints
 
 ## 3. Failure accounting and `/health` (D4)
 
-- [ ] 3.1 Per-scope registry: index failures, embedding failures (from typed `EmbedPassResult` provider failures), last success/failure; enumeration-failure counter; updated from every entrypoint in both modes; replace the local counter in `run_indexer_loop`
+- [ ] 3.1 Per-scope registry: index failures, `rederive_incomplete`, embedding failures (from typed `EmbedPassResult` provider failures), last success/failure; enumeration-failure counter; updated from every entrypoint in both modes; replace the local counter in `run_indexer_loop`
 - [ ] 3.2 `_on_indexer_done` records "task not running" on exception/unexpected return, not on lifespan cancellation; `disabled` under `MCP_SANDBOX_MODE`
 - [ ] 3.3 `INDEXER_DEGRADED_AFTER_FAILURES` (default 3); CRITICAL log once per counter on reaching it, re-armed on reset
 - [ ] 3.4 `/health`: `indexer` object and `degraded` top-level status per spec; HTTP 200; no paths/errors/ids; update docstring
