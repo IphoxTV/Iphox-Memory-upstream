@@ -32,7 +32,7 @@ Constraints from `docs/architecture/` and `openspec/specs/index-integrity/spec.m
 
 ### D1. The walk records structured failed prefixes
 
-The walk callback records, for every directory it could not open or list (the same errnos that are recorded as skips today), the vault-relative prefix — `""` for the root itself. `ScanResult` gains `walk_failed_prefixes: list[str]`; `walk_failures` keeps its human-readable strings. No change to which errnos count.
+The walk callback records, for every directory it could not open or list (the same errnos that are recorded as skips today), the vault-relative prefix — `""` for the root itself. It also records the entry's path as a failed prefix when the entry's **type** cannot be determined (`DirEntry.is_dir()` raising, `indexer.py:1814-1818`): such an entry may be a directory, so its exact path and its subtree are protected (codex spec r1 B1). `ScanResult` gains `walk_failed_prefixes: list[str]`; `walk_failures` keeps its human-readable strings. No change to which errnos count.
 
 ### D2. Rows under a failed prefix are neither pruned nor move-paired
 
@@ -52,30 +52,37 @@ In `_index_vault_attempt`, before move pairing, a path `p` from `locked` is **pr
 
 The same predicate is evaluated again against `locked` inside `_index_vault_attempt` (a row may have been inserted between snapshot and lock by a concurrent write path); there it raises before any mutation, and the attempt's transaction rolls back with nothing written.
 
-The error message names the condition and the row count, never paths: `vault root is empty but the index holds N notes; nothing was deleted. If the vault was emptied on purpose, confirm it in the panel (Settings → Danger zone, or the user's page).` It surfaces through #308's existing accounting: run row `failed`, `index_consecutive_failures`, CRITICAL at the threshold, `/health` degraded. The embed stage still runs over committed rows in single-user mode (#308 D9).
+The error message names the condition and the row count, never paths: `vault root is empty but the index holds N notes; nothing was deleted. If the vault was emptied on purpose, confirm it in the panel (Settings → Danger zone, or the user's page).` It surfaces through #308's existing accounting: run row `failed`, `index_consecutive_failures`, CRITICAL at the threshold, `/health` degraded. The embed stage still runs over committed rows in single-user mode (#308 D9), including after a **manual** single-user reindex, whose stages this change isolates the same way (today it rethrows before embedding, `routes.py:3041-3044`; codex spec r1 m1).
 
 - *Why "no files at all" rather than a fraction:* the owner chose an explicit confirmation for the zero-files case and no threshold. A zero-file root over a non-empty index is unambiguous enough to refuse; any threshold would be a heuristic (L1).
 - *Why `.md` files and not any entry:* the index holds only notes; a root that contains attachments but no notes still deletes every row.
 - A scope with no rows (a new user, an emptied-and-confirmed vault) is never refused.
+- **Exception — the provenance discard.** `_reconcile_provenance` (indexer.py ~2377-2434) runs before the walk and deletes a scope's index when its vault **assignment** demonstrably changed (index-integrity: "An assignment that demonstrably changed discards the previous vault's index"). That is an administrator's reassignment, not a mount accident, and it is unchanged: D3's "nothing deleted" covers the ordinary prune of a pass, not a discard decided by provenance. After a discard the scope has no rows, so D3 does not refuse the next empty walk (codex spec r1 M1).
 
 ### D4. Accounting
 
-`indexer_health` gains a per-scope `walk_incomplete` counter with the same semantics as `rederive_incomplete`: increment per committed pass with a non-root walk failure, reset by a pass with none, counted toward degradation at `INDEXER_DEGRADED_AFTER_FAILURES`, included in `max_consecutive_failures`, and a CRITICAL once per episode. `/health` adds no new field beyond what #308 defines; `failing_scopes` counts a scope degraded by any of its counters. (D3 needs no new counter: it raises.)
+`indexer_health` gains a per-scope `walk_incomplete` counter with the same semantics as `rederive_incomplete`: increment per committed pass with a non-root walk failure, reset by a pass with none, counted toward degradation at `INDEXER_DEGRADED_AFTER_FAILURES`, included in `max_consecutive_failures`, and a CRITICAL once per episode. `/health` adds no new field beyond what #308 defines. `failing_scopes` is redefined, once, as the number of distinct scopes with **any** of their index, incomplete-re-derive or incomplete-walk counters at or over the threshold (deduplicated; embedding failures keep their own `embedding_failing_scopes`) — today it counts only the index counter (`indexer_health.py:241`; codex spec r1 m2). (D3 needs no new counter: it raises.)
 
 ### D5. Operator confirmation of an emptied vault
 
-An admin-only panel action **Confirm vault is empty** grants a scope a single-use permission, valid for 15 minutes, for the next pass to prune an empty root, and starts a reindex of that scope in the background (`_reindex_background`, existing).
+An admin-only panel action **Confirm vault is empty** grants one scope a single-use empty-prune permission valid for 15 minutes, and starts an index pass **for that scope only**.
 
-- Single-user: in the settings Danger zone. Multi-user: on the user's edit page, per user (an admin confirms for that user's vault).
-- The control uses the existing signed one-time-token confirmation page pattern (as `reembed_confirm.html`, salt registry in `routes.py`), a `type="button"` with `data-confirm` that fails closed, no inline handlers or styles (`docs/architecture/control-panel.md`). The confirmation page states the row count that will be deleted.
-- The permission is in-process (`indexer_health` or a sibling registry), keyed by scope, holds an expiry, and is **consumed** by the first pass for that scope that evaluates D3's predicate — whether or not the root is empty at that moment — so it never lingers to authorise a later accidental empty mount. A process restart drops it (the operator confirms again).
-- Granting and consuming are each logged at WARNING with the admin's username and the scope, and the consuming pass logs the number of rows pruned.
-- D2 still applies: a confirmation never authorises pruning beneath a directory that failed to list, and never overrides an unlistable root (`""`).
+**Placement.** Single-user: the settings Danger zone. Multi-user: the user's edit page, per user.
+
+**Confirmation token (codex spec r1 M2).** The existing re-embed confirmation (`routes.py:159-160, ~2746-2770`) is signed but neither single-use nor bound to anything, so it is not reused as is. This action gets its own serializer salt. Its token payload binds: the action name, the target scope (`None` or user id), the issuing administrator's user id, the scope's vault assignment string at issue time, and a random nonce. Redemption requires: a valid signature for this salt; age ≤ 10 minutes (token expiry, separate from the permission's 15-minute TTL); the redeeming administrator equals the issuer; the target scope equals the posted scope; the scope's current assignment equals the bound one; and the nonce not yet consumed — consumption is an atomic insert into an in-process consumed-nonce set (single worker, entries kept until their token's expiry). Any mismatch refuses with nothing granted. The confirmation page states the number of indexed notes that would be deleted.
+
+**Target eligibility (codex spec r1 M4).** The action is refused, with nothing granted, when the target user is inactive, has no vault assigned, is deleted, or is quarantined by the vault-overlap snapshot. Single-user always has its one scope.
+
+**Targeted pass (codex spec r1 M4).** A new background entrypoint runs `index_vault` (and then the embed stage) for exactly the target scope, with #308's accounting and quarantine recovery. Existing callers of `_reindex_background` (panel Reindex, re-embed, reset; `routes.py:2740, 2816, 2982-2984`) keep their all-user behaviour.
+
+**Permission lifecycle (codex spec r1 M3).** The registry holds, per scope, `(expires_at, assignment)`. A pass **takes** the permission atomically at its first evaluation of D3's predicate (pre-lock), whether or not the root is empty, removing it from the registry and carrying it as an invocation-local authorisation `(expires_at, assignment)`. The locked re-evaluation uses that same authorisation, never the registry. Before the prune mutation the pass re-checks `now < expires_at` and that the assignment is unchanged; if either fails it raises `IndexIndeterminate` as if no permission existed. The authorisation survives #308's quarantine restarts within the same invocation, and is never returned to the registry after failure, cancellation or restart. A process restart drops ungranted permissions (re-confirm).
+
+**Audit.** Granting and taking are each logged at WARNING with the scope and (for granting) the administrator's username; the consuming pass logs the number of rows pruned. D2 still applies: a permission never authorises pruning beneath an unlisted prefix, and never overrides an unlistable root (`""`).
 
 ### D6. Tests
 
 - Unit: prefix recording for root, nested and sibling-name cases (`sub` vs `subway.md`); D2 exclusion from prune and from `deleted_by_hash`; D3 predicate (root failure; empty with rows; empty without rows; empty with permission; permission consumed; permission expired); `walk_incomplete` accounting and `/health`; panel routes (admin-only, token required, wrong/expired token refused, permission granted, background reindex started) and template rendering.
-- Real Postgres (`tests/integration/`): a `chmod 000` subdirectory with indexed rows beneath it — rows and embeddings survive, an unrelated new file with the same hash elsewhere is inserted as new (not a move of the protected row), other notes commit, run record names the directory; restoring the mode re-indexes nothing under it (hashes unchanged); an empty root over 50 rows — nothing deleted, run failed, counter incremented; then grant the permission and run — rows pruned once, permission consumed; a second empty pass without a new permission raises again; root `scandir` failure raises; multi-user: one tenant's empty root does not affect another's.
+- Real Postgres (`tests/integration/`): a `chmod 000` subdirectory with indexed rows beneath it — rows and embeddings survive, an unrelated new file with the same hash elsewhere is inserted as new (not a move of the protected row), other notes commit, run record names the directory; restoring the mode re-indexes nothing under it (hashes unchanged); an empty root over 50 rows — nothing deleted, run failed, counter incremented; then grant the permission and run — rows pruned once, permission consumed; re-insert rows (a fresh populated pass), empty the root again, and assert the next pass raises without a new permission (codex spec r1 m3); the locked re-evaluation uses the taken authorisation; an authorisation whose expiry passes during the lock wait refuses; a populated pass consumes the permission without pruning; tokens: replayed, cross-scope, cross-admin, stale-assignment and expired tokens refused; targeted pass touches no other tenant; ineligible targets refused; manual single-user reindex embeds after an indeterminate index stage; an entry whose type lookup raises protects its subtree; root `scandir` failure raises; multi-user: one tenant's empty root does not affect another's.
 
 ## Risks / Trade-offs
 
@@ -87,6 +94,10 @@ An admin-only panel action **Confirm vault is empty** grants a scope a single-us
 ## Migration Plan
 
 No schema change. Deploy via the k3s image bump. Rollback: previous image.
+
+## Spec review round 1 (Codex) — disposition
+
+All eight findings accepted: B1 (type-lookup failures protect their subtree), M1 (provenance discard stated as an exception), M2 (dedicated, bound, single-use token), M3 (invocation-local authorisation with expiry re-check), M4 (targeted pass and eligibility), m1 (manual single-user stage isolation), m2 (`failing_scopes` defined once), m3 (test sequence corrected).
 
 ## Open Questions
 

@@ -34,7 +34,7 @@ The indexer SHALL keep, per scope, the number of consecutive failed index passes
 
 ### Requirement: A pass SHALL NOT prune or move-pair a row beneath a directory it could not list
 
-The walk SHALL record the vault-relative prefix of every directory it could not open or list, using the same failures it already records as skips. During the pass, a row whose path, read under the generation lock, equals such a prefix or lies beneath it (prefix followed by `/`) SHALL be excluded from deletion and from move-source pairing, and its quarantine entry SHALL NOT be cleared for being unseen; every other row SHALL be processed and committed as usual. The pass SHALL log one WARNING naming the unlisted directories (bounded, with a count of the remainder) and the number of rows protected, and its run record SHALL carry a line naming them (at most five, then an ellipsis, rendered so the record is always storable), labelled as a failed run on the panel. A directory that no longer exists when the walk opens it, a symlink, and a non-directory SHALL keep their present treatment.
+The walk SHALL record the vault-relative prefix of every directory it could not open or list, using the same failures it already records as skips, and of every entry whose type it could not determine. During the pass, a row whose path, read under the generation lock, equals such a prefix or lies beneath it (prefix followed by `/`) SHALL be excluded from deletion and from move-source pairing, and its quarantine entry SHALL NOT be cleared for being unseen; every other row SHALL be processed and committed as usual. The pass SHALL log one WARNING naming the unlisted directories (bounded, with a count of the remainder) and the number of rows protected, and its run record SHALL carry a line naming them (at most five, then an ellipsis, rendered so the record is always storable), labelled as a failed run on the panel. A directory that no longer exists when the walk opens it, a symlink, and a non-directory SHALL keep their present treatment.
 
 #### Scenario: Rows under an unreadable folder survive
 
@@ -45,6 +45,11 @@ The walk SHALL record the vault-relative prefix of every directory it could not 
 
 - **WHEN** a folder holding an indexed note cannot be listed and a new file elsewhere has the same content hash as that note
 - **THEN** the new file SHALL be inserted as a new note and the protected row SHALL keep its path
+
+#### Scenario: An entry whose type cannot be determined is protected
+
+- **WHEN** determining whether the entry `sub` is a directory fails with an I/O error while other notes are discovered
+- **THEN** the rows at `sub` and beneath `sub/` SHALL be neither pruned nor paired as a move source
 
 #### Scenario: A sibling with a shared name prefix is not protected
 
@@ -58,7 +63,7 @@ The walk SHALL record the vault-relative prefix of every directory it could not 
 
 ### Requirement: An unlistable root, or an empty root over an existing index, SHALL abort the pass with nothing deleted
 
-An index pass SHALL raise before its locked transaction, writing nothing, when the vault root itself cannot be listed, or when the walk discovers no markdown file at all while the scope's index holds at least one row, unless the scope holds an unexpired empty-prune permission granted by an administrator. The same condition SHALL be re-evaluated against the rows read under the generation lock, and SHALL raise there before any mutation. The error SHALL state the condition and the number of indexed notes, SHALL name where the permission is granted, and SHALL NOT name any path. Such a pass SHALL be recorded as failed in its run record and counted as a failed index pass. A scope whose index holds no rows SHALL NOT be refused. A permission SHALL be single-use: the first pass of that scope that evaluates this condition SHALL consume it whether or not the root is empty, and it SHALL expire 15 minutes after it was granted. A permission SHALL NOT authorise pruning beneath an unlisted directory and SHALL NOT override an unlistable root.
+An index pass SHALL raise before its locked transaction, writing nothing, when the vault root itself cannot be listed, or when the walk discovers no markdown file at all while the scope's index holds at least one row, unless the scope holds an unexpired empty-prune permission granted by an administrator. The same condition SHALL be re-evaluated against the rows read under the generation lock, and SHALL raise there before any mutation. The error SHALL state the condition and the number of indexed notes, SHALL name where the permission is granted, and SHALL NOT name any path. Such a pass SHALL be recorded as failed in its run record and counted as a failed index pass. A scope whose index holds no rows SHALL NOT be refused. A permission SHALL be single-use: the first pass of that scope that evaluates this condition SHALL take it atomically, whether or not the root is empty, and SHALL use that taken authorisation — never the registry — for its re-evaluation under the lock and across its own restarts; the authorisation SHALL NOT be returned after failure or cancellation. A permission SHALL expire 15 minutes after it was granted, and the pass SHALL re-check the expiry and that the scope's vault assignment is unchanged immediately before pruning, refusing if either fails. This requirement governs the pass's ordinary prune; a provenance discard decided because the vault assignment demonstrably changed is not affected by it. A permission SHALL NOT authorise pruning beneath an unlisted directory and SHALL NOT override an unlistable root.
 
 #### Scenario: An empty mount deletes nothing
 
@@ -69,7 +74,12 @@ An index pass SHALL raise before its locked transaction, writing nothing, when t
 
 - **WHEN** an administrator confirms that the scope's vault is empty and the next pass finds no markdown file
 - **THEN** that pass SHALL delete the scope's rows, consume the permission and log the number of rows deleted
-- **AND** a later pass that again finds an empty root over a non-empty index SHALL raise unless a new permission is granted
+- **AND** after the scope is indexed again and its root is emptied again, the next pass SHALL raise unless a new permission is granted
+
+#### Scenario: A permission that expires during the lock wait authorises nothing
+
+- **WHEN** a pass takes a permission and its 15-minute expiry passes before the pass reaches its prune
+- **THEN** the pass SHALL raise with nothing deleted
 
 #### Scenario: A permission is not kept for later
 
