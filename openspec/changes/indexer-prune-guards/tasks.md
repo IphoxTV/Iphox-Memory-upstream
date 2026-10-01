@@ -32,6 +32,6 @@
 
 ## 7. Gates
 
-- [ ] 7.1 Offline suite and `make test-integration` green
-- [ ] 7.2 `openspec-verifier`; adversarial Codex (deletion path → mandatory)
+- [x] 7.1 Offline suite and `make test-integration` green
+- [x] 7.2 `openspec-verifier`; adversarial Codex (deletion path → mandatory)
 - [ ] 7.3 Deploy (k3s image bump PR); live check; owner browser/CSP pass on the new panel controls
