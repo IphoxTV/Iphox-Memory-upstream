@@ -803,6 +803,97 @@ next unforeseen value costs one note rather than its owner's whole index.
   (`degraded`, no paths). **A quarantining pass is a successful pass**:
   nothing derives success from the `error` column.
 
+## A pass does not prune what it could not see (#309)
+
+The prune set used to be `existing − seen`, and "not seen" was read as "gone
+from disk". Two ordinary host problems make the walk see less than is there:
+a subdirectory it cannot list (another uid's restrictive mode, EACCES/EIO on
+`scandir`) and an empty-but-openable root (a mount that did not mount, a
+Docker-created empty bind source, a misbound volume). The first deleted every
+row under the folder — or **move-paired** one to an unrelated same-hash file
+and rewrote it in place — and the second deleted the owner's whole index; both
+runs were recorded clean.
+
+- **The walk records structured failed prefixes** (D1).
+  `discover_markdown_files_at(…, failed_prefixes=)` appends the vault-relative
+  path of every directory it could not open or list — the same errnos already
+  recorded as skips, `""` for the root's own listing — and of every entry whose
+  type lookup (`DirEntry.is_dir()`) raised, because that entry may be a
+  directory. `ScanResult.walk_failed_prefixes`; `walk_failures` keeps the
+  human-readable strings. ELOOP/ENOTDIR (a directory symlink, a non-directory)
+  and ENOENT (a directory that vanished between listing and open — its rows
+  really are gone) are unchanged non-skips.
+- **Rows at or beneath a failed prefix are protected** (D2). In
+  `_index_vault_attempt`, against the **locked** rows: a path `p` is protected
+  if `p == pref` or `p.startswith(pref + "/")` for a non-root prefix — so `sub`
+  protects `sub/a.md` and `sub/x/b.md` but not `subway.md` (`_walk_protected`).
+  Protected paths leave the prune set **before** `deleted_by_hash` is built, so
+  they are neither deleted nor a move source. The quarantine sweep does not
+  clear an entry beneath a failed prefix for being unseen — decided by prefix
+  over the entries, since a quarantined note's row was already pruned and is
+  never among the protected rows. Everything else commits. One WARNING
+  names the directories (at most five, then `(+N more)`) and the rows kept; the
+  run record gains `walk incomplete: N dir(s) not listed: <dir>, … (+N more)` (`backslash
+  replace`, line breaks escaped, like the quarantine line), which `run_outcome`
+  labels **failed** — part of the vault was not indexed. `IndexPassResult`
+  carries `walk_failed` and `walk_protected`. A folder that stays unreadable
+  keeps its last-known rows indefinitely: by design, reported as degraded.
+- **An unlistable root, or an empty root over an existing index, is
+  indeterminate** (D3). `_index_vault_pinned` raises `IndexIndeterminate` (a
+  `RuntimeError`) before the generation lock, with nothing written, when `""`
+  is a failed prefix, or when the walk discovered **no** `.md` file while the
+  pre-lock snapshot has rows and no valid empty-prune permission is held. The
+  same predicate (`_check_determinate`) is re-evaluated against the locked rows
+  before any mutation — a note can be written into an empty scope between the
+  snapshot and the lock. The message states the condition and the row count and
+  where to confirm, never a path. It is an ordinary failed pass to #308's
+  accounting: run row failed, `index_consecutive_failures`, CRITICAL at the
+  threshold, `/health` degraded. "No `.md` files" rather than "no entries":
+  a root holding only attachments would still delete every row. A scope with
+  no rows is never refused. **The provenance discard is the stated exception**:
+  `_reconcile_provenance` deleting a scope whose assignment demonstrably
+  changed is an administrator's reassignment, not a mount accident, and is
+  untouched; afterwards the scope has no rows, so the next empty walk is not
+  refused.
+- **The empty-prune permission** (D5, `src/services/empty_prune.py`). An
+  in-process registry, one entry per scope: `grant(scope, assignment, *,
+  ttl_seconds=900, granted_by=None)`, `take(scope)` (atomic remove → frozen
+  `Authorisation(scope, expires_at, assignment)` or None), `pending(scope)`,
+  `reset()` for tests. Expiry is on the monotonic clock. A pass **takes** the
+  permission at its first evaluation of the predicate (pre-lock) **whether or
+  not the root is empty** — a permission left for later would authorise an
+  emptying nobody confirmed — and carries it as an invocation-local value: the
+  locked re-check uses it (never the registry), it survives #308's quarantine
+  restarts within the invocation, and it is never returned after failure,
+  cancellation or restart. A permission authorises only if unexpired and
+  granted for the pass's canonical assignment; immediately before the prune
+  DELETE an authorised empty-root pass re-checks expiry and the **current**
+  assignment (`settings.vault_path`, or a plain non-locking read of the `users`
+  row — the transaction already holds `notes_metadata` row locks, see
+  `_assert_still_assigned`). Grant, take and the authorised prune (with its row
+  count) each log a WARNING. A permission never overrides an unlistable root and
+  never authorises a prune beneath a failed prefix. A restart drops an untaken
+  permission (L2): re-confirm.
+- **The scope-targeted pass.** `index_scope_now(user_id, *, trigger="manual")
+  -> bool` runs overlap detection (before `index_pass_lock`), warms that user's
+  vault cache, and then `_index_pass_once(user_id, trigger, full_hash=True)`
+  under the lock — index, then embed, each stage isolated and recorded — for
+  exactly one scope. It is what the panel's confirmation starts; the existing
+  `_reindex_background` callers keep their all-user behaviour. The panel's
+  manual single-user reindex now isolates its stages like the loop (#308 D9):
+  an index stage that raised (an indeterminate root) no longer stops the embed
+  stage.
+- **Accounting** (D4). `indexer_health.record_walk(scope, incomplete)`, called
+  from `record_index_outcome` for every committed pass at every entrypoint:
+  `walk_incomplete` increments on a pass with any non-root failed prefix and
+  resets on one with none; it counts toward degraded, `max_consecutive_failures`
+  and the once-per-episode CRITICAL. `failing_scopes` is the number of
+  **distinct** scopes with any of the index, incomplete-re-derive or
+  incomplete-walk counters at the threshold.
+- **L1: a wrong but non-empty mount is not detected.** A different, smaller
+  directory mounted in place of the vault still prunes the difference; catching
+  it would need a share-of-index threshold, a heuristic the owner did not want.
+
 ## Non-finite frontmatter numbers, and the one title rule (#154)
 
 `x: .nan` is valid YAML. `NaN`, `Infinity` and `-Infinity` are not valid JSON,

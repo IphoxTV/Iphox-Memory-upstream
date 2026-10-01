@@ -80,8 +80,16 @@ async def test_index_vault_reads_and_deletes_only_null_owned_rows(monkeypatch, t
     session = _Session([_Result([old]), _Result([old])])
     monkeypatch.setattr(indexer, "async_session", lambda: session)
     monkeypatch.setattr(indexer, "_vault_root", lambda _uid: tmp_path)
+    # The root is empty over one row, so the prune needs the operator's
+    # empty-prune permission (#309, D3/D5), granted for this root.
+    monkeypatch.setattr(indexer.settings, "vault_path", str(tmp_path), raising=False)
+    from src.services import empty_prune
+    from src.services.transfer import canonical_vault_root
+
+    empty_prune.grant(None, canonical_vault_root(tmp_path))
 
     await indexer.index_vault(user_id=None)
+    assert not empty_prune.pending(None), "the permission is consumed"
 
     # Searched rather than indexed: the pass now opens its transaction with
     # the generation lock and the `indexer_state` probe (D7c3), so the scoped

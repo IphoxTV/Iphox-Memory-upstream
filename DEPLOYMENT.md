@@ -579,7 +579,18 @@ is pennies a month.
   files` shows in the logs. Check that your `VAULT_HOST_PATH` on the
   host actually contains `.md` files and that the bind mount is
   reading from the right place (`docker compose exec obsidian-mcp ls
-  /obsidian` should show your notes).
+  /obsidian` should show your notes). If the index already holds notes,
+  the pass refuses to delete them: it fails with "vault root is empty
+  but the index holds N note(s); nothing was deleted", the run is
+  recorded as failed and `/health` turns `degraded` after three such
+  passes. Fix the mount and the next pass carries on. If you emptied the
+  vault on purpose, confirm it in the panel (Settings → Danger zone, or
+  the user's page in multi-user mode); that lets the next pass prune
+  once. A vault root that cannot be listed at all, or a subfolder the
+  server cannot read, likewise deletes nothing: the subfolder's notes
+  keep their index rows and the run record names the folder. A mount
+  that is wrong but *not* empty (a different, smaller directory) is not
+  detected, and its pass prunes whatever is missing from it.
 - Nextcloud not seeing agent writes. The OS-level write happens
   immediately, but Nextcloud only knows about it on its next scan.
   Either configure the Nextcloud cron, or run `php occ files:scan

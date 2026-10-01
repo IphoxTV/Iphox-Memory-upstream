@@ -20,6 +20,11 @@
 </div>
 
 <div class="page-body">
+    {# The session flash (#138): the outcome of "Confirm vault is empty" and
+       the re-embed fingerprint refusal land here. #}
+    {% if flash %}
+    <div class="alert {% if flash_kind == 'err' %}alert-warning{% else %}alert-success{% endif %} anim-1">{{ flash }}</div>
+    {% endif %}
     <div class="split-2">
 
         <!-- Indexer -->
@@ -133,6 +138,27 @@
                     Reset embeddings
                 </button>
             </div>
+            {% if not multi_user_mode %}
+            {# #309 D5. Multi-user mode confirms per user, on the user's page. #}
+            <div class="settings-danger-row u-margin-top-20px">
+                <div class="u-flex-1 u-min-width-240px">
+                    <p class="settings-danger-title">
+                        Confirm vault is empty
+                    </p>
+                    <p class="settings-danger-text">
+                        The indexer will not delete the index when the vault
+                        root contains no markdown files — that is usually a
+                        mount that did not mount. If the vault really was
+                        emptied, confirm it here: the next pass may then
+                        delete every indexed note. The next page shows how
+                        many and asks again.
+                    </p>
+                </div>
+                <a href="/admin/settings/confirm-empty-vault" class="btn btn-danger">
+                    Confirm vault is empty
+                </a>
+            </div>
+            {% endif %}
         </div>
     </div>
 </div>

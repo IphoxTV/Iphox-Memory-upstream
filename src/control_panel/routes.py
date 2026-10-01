@@ -2817,6 +2817,54 @@ async def trigger_reembed(
     return RedirectResponse("/admin/settings", status_code=303)
 
 
+@router.get("/settings/confirm-empty-vault", response_class=HTMLResponse)
+async def confirm_empty_vault_page(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_admin_panel),
+):
+    """Single-user "Confirm vault is empty" (#309, D5): the confirmation page.
+
+    The token rules and why the re-embed pattern was not reused are in
+    `empty_vault_confirm`. Multi-user mode confirms per user, on
+    `/admin/users/{id}/confirm-empty-vault`; here it renders the refusal.
+    """
+    from src.control_panel import empty_vault_confirm
+
+    return await empty_vault_confirm.render_confirm_page(
+        request,
+        session,
+        user,
+        None,
+        templates,
+        post_action="/admin/settings/confirm-empty-vault",
+        cancel_url="/admin/settings",
+    )
+
+
+@router.post("/settings/confirm-empty-vault")
+async def confirm_empty_vault(
+    request: Request,
+    token: str = Form(""),
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_admin_panel),
+):
+    """Redeem the token: grant the single-user scope its empty-prune
+    permission and start a pass for it alone. Existing `_reindex_background`
+    callers are untouched; this one goes through `index_scope_now`."""
+    from src.control_panel import empty_vault_confirm
+
+    return await empty_vault_confirm.handle_confirm_post(
+        request,
+        session,
+        user,
+        None,
+        token,
+        back_url="/admin/settings",
+        done_url="/admin/settings",
+    )
+
+
 @router.post("/settings/reset-embeddings")
 async def reset_embeddings(
     request: Request,
@@ -3030,20 +3078,38 @@ async def _reindex_background(full_hash: bool = False):
                         record_embed_outcome(uid, embedded)
         else:
             async with record_indexer_run("manual", None) as stats:
-                # Recorded and re-raised: the single-user manual pass keeps
-                # failing loudly to the background task, and its outcome still
-                # reaches the `/health` counters (#308 D4).
+                # Each stage on its own, as the loop's tick does (#308 D9,
+                # #309 D3): an index stage that raised — an indeterminate
+                # empty root, say — must not stop the embed stage over the
+                # rows already committed. Both outcomes are written to the
+                # run row and reach the `/health` counters (#308 D4).
                 try:
                     index_result = await index_vault(full_hash=full_hash)
                     stats.record_index(index_result)
-                except Exception:
+                except Exception as e:
+                    stats.record_error("index", e)
                     record_index_outcome(None, False)
-                    raise
-                record_index_outcome(None, True, index_result)
+                    security_events.emit(
+                        "panel_ondemand_index_failed",
+                        level=logging.ERROR,
+                        subject=security_events.subject_for(user_id=None),
+                        user_id=None,
+                        error_type=type(e).__name__,
+                    )
+                else:
+                    record_index_outcome(None, True, index_result)
                 try:
                     embedded = await embed_vault()
-                except Exception:
+                except Exception as e:
+                    stats.record_error("embed", e)
                     record_embed_outcome(None, raised=True)
-                    raise
-                stats.record_embedded(embedded)
-                record_embed_outcome(None, embedded)
+                    security_events.emit(
+                        "panel_ondemand_embed_failed",
+                        level=logging.ERROR,
+                        subject=security_events.subject_for(user_id=None),
+                        user_id=None,
+                        error_type=type(e).__name__,
+                    )
+                else:
+                    stats.record_embedded(embedded)
+                    record_embed_outcome(None, embedded)

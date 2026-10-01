@@ -286,6 +286,16 @@ update it in the same change.** What stays here is the short list:
   full-precision distance. Recall measured 1.00 → 1.00; ~146 MB → 45 MB.
   Embedding reuses a stored vector only on exact chunk text and a matching
   model fingerprint, re-verified under the generation lock (#281).
+- **A pass does not prune what it could not see** (#309). Rows at or beneath
+  a directory the walk could not list (or type) are neither pruned nor
+  move-paired, and the run is recorded `walk incomplete` (failed). An
+  unlistable root, or an empty root over an existing index, raises
+  `IndexIndeterminate` with nothing deleted — unless an admin confirmed the
+  emptying in the panel: a single-use, 15-minute, in-process permission
+  (`src/services/empty_prune.py`) taken by the scope's next pass either way.
+  The provenance discard is the stated exception. A wrong but non-empty
+  mount is not detected (L1) — see
+  [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 

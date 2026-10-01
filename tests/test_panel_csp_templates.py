@@ -166,7 +166,14 @@ def test_every_stylesheet_link_is_google_fonts(path):
 # Where the eight pre-change `confirm()` controls live (spec: "The eight
 # existing confirm() controls MUST fail closed"). A ninth needs a deliberate
 # edit here; so does losing one.
-_EXPECTED_CONFIRMS = {"keys.html": 3, "oauth.html": 2, "settings.html": 1, "user_edit.html": 2}
+# #309 added a ninth: the "Confirm vault is empty" page's final control.
+_EXPECTED_CONFIRMS = {
+    "keys.html": 3,
+    "oauth.html": 2,
+    "settings.html": 1,
+    "user_edit.html": 2,
+    "empty_vault_confirm.html": 1,
+}
 
 
 def _type_of(attrs: str) -> str | None:

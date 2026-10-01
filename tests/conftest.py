@@ -326,6 +326,16 @@ def _reset_note_quarantine():
     indexer.clear_quarantine()
 
 
+@pytest.fixture(autouse=True)
+def _reset_empty_prune():
+    """Start every test with no empty-prune permission held (#309, D5)."""
+    from src.services import empty_prune
+
+    empty_prune.reset()
+    yield
+    empty_prune.reset()
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
