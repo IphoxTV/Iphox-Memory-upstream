@@ -13,7 +13,9 @@
 # image is built from exactly the commit CI has already proven, with no second
 # copy of that setup to drift.
 #
-#   workflow_run      CI succeeded on a push to main -> build, scan, push.
+#   workflow_run      CI succeeded on a push to main -> build, scan, push
+#                     (skipped when no image input changed: see the
+#                     "Image-relevant change?" step), plus the Flux tag.
 #   workflow_dispatch manual re-push of main; refuses unless CI succeeded for
 #                     that exact commit on a push to main.
 #   pull_request      only when this file changes: build + scan, never push,
@@ -157,8 +159,66 @@ jobs:
         with:
           ref: ${{ env.BUILD_SHA }}
           persist-credentials: false
+          fetch-depth: 0   # the change check below diffs against an older commit
+
+      # Docs-only merges must not rebuild: a new image restarts the pod, and
+      # every pod start takes a pre-migrate pg_dump. `on.workflow_run` has no
+      # `paths` filter (it fires on every CI completion), so the filter is this
+      # step. The base is the commit the currently published `main` image was
+      # built from (its org.opencontainers.image.revision label), not the
+      # previous main commit, so a skipped docs merge followed by a code merge,
+      # a multi-commit push, or a build that failed last time are all covered.
+      # Anything it cannot establish (no label, unreadable registry, base not an
+      # ancestor, same commit = re-run, workflow_dispatch) means BUILD.
+      # Image inputs = what the Dockerfile COPYs, plus the Dockerfile, the scan
+      # config and this workflow; requirements*.txt and docker/ are included
+      # deliberately broad. docs/, openspec/, tests/ and *.md are not inputs.
+      - name: Image-relevant change?
+        env:
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          relevant='^(src/|alembic/|scripts/|docker/)|^(alembic\.ini|Dockerfile|\.dockerignore|\.trivyignore|requirements[^/]*\.txt|\.github/workflows/image\.yml)$'
+          build=true
+          reason="workflow_dispatch always builds"
+          if [ "$EVENT" = workflow_run ]; then
+            base=""
+            if echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin >/dev/null 2>&1; then
+              base=$(docker buildx imagetools inspect "${IMAGE}:main" \
+                       --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null || true)
+              docker logout ghcr.io >/dev/null 2>&1 || true
+            fi
+            if ! [[ "$base" =~ ^[0-9a-f]{40}$ ]]; then
+              reason="no readable revision on ${IMAGE}:main"
+            elif [ "$base" = "$BUILD_SHA" ]; then
+              reason="${IMAGE}:main is already ${BUILD_SHA} (re-run)"
+            elif ! git merge-base --is-ancestor "$base" "$BUILD_SHA" 2>/dev/null; then
+              reason="published revision ${base} is not an ancestor of ${BUILD_SHA}"
+            else
+              changed=$(git diff --name-only "$base" "$BUILD_SHA")
+              hits=$(grep -E "$relevant" <<<"$changed" || true)
+              if [ -n "$hits" ]; then
+                reason="image inputs changed since ${base}: $(tr '\n' ' ' <<<"$hits")"
+              else
+                build=false
+                reason="no image input changed since ${base}"
+              fi
+            fi
+          fi
+          echo "$reason"
+          echo "IMAGE_RELEVANT=${build}" >> "$GITHUB_ENV"
+          if [ "$build" = false ]; then
+            {
+              echo "### obsidian-mcp image"
+              echo
+              echo "\`${BUILD_SHA}\` **not built or pushed**: ${reason}."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Build
+        if: env.IMAGE_RELEVANT == 'true'
         run: |
           set -euo pipefail
           docker build \
@@ -170,6 +230,7 @@ jobs:
       # Same flags as `make trivy`: HIGH,CRITICAL with an available fix fails
       # the job, vuln scanner only. .trivyignore is honoured when present.
       - name: Trivy scan (HIGH/CRITICAL, ignore-unfixed)
+        if: env.IMAGE_RELEVANT == 'true'
         run: |
           set -euo pipefail
           ignore=()
@@ -184,6 +245,7 @@ jobs:
               obsidian-mcp:ci
 
       - name: Push to GHCR
+        if: env.IMAGE_RELEVANT == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           ACTOR: ${{ github.actor }}
@@ -215,4 +277,42 @@ jobs:
             echo "    digest: ${digest}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          docker logout ghcr.io
+
+      # Flux image automation (maxkuminov/infra docs/homelab-image-automation.md,
+      # D1): an immutable, sortable main-<shortsha>-<run_number> tag next to
+      # the tags above. github.run_number is unchanged by a re-run, so a re-run
+      # of an old commit can never outrank a newer one. Published only on the
+      # workflow_run path, only while the built commit is still the main tip (a
+      # slower run for an older push must not publish after a newer one), and
+      # only once: a re-run that finds the tag present does not re-push it.
+      # Every other tag above behaves exactly as before.
+      - name: Push Flux tag (main-<shortsha>-<run_number>)
+        if: github.event_name == 'workflow_run' && env.IMAGE_RELEVANT == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          BRANCH: main
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::bad run number '$RUN_NUMBER'"; exit 1; }
+          tag="${BRANCH}-${SHORT_SHA}-${RUN_NUMBER}"
+          tip=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${BRANCH}" --jq .sha)
+          if [ "$tip" != "$BUILD_SHA" ]; then
+            echo "::notice::${BRANCH} is now ${tip}, not ${BUILD_SHA}: ${tag} not published"
+            echo "Flux tag \`${tag}\` **not published**: ${BRANCH} moved on to \`${tip}\`." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          if out=$(docker manifest inspect "${IMAGE}:${tag}" 2>&1); then
+            echo "::notice::${IMAGE}:${tag} already exists (re-run): not re-pushed"
+            echo "Flux tag \`${tag}\` already present (re-run): not re-pushed." >> "$GITHUB_STEP_SUMMARY"
+          elif grep -qiE 'manifest unknown|no such manifest' <<<"$out"; then
+            docker tag obsidian-mcp:ci "${IMAGE}:${tag}"
+            docker push "${IMAGE}:${tag}"
+            echo "Flux tag \`${tag}\` published." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::cannot tell whether ${IMAGE}:${tag} exists: ${out}"; exit 1
+          fi
           docker logout ghcr.io

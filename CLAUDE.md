@@ -35,7 +35,13 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
   - Transfer routes (`/transfer/*`): same router as `/mcp` (no OAuth chain);
     capability-token auth at app level
 - Registry: `localhost:5000` (or change in `Makefile`)
-- Deploy: `make deploy` (build → scan → push → backup → migrate → recreate)
+- Production deploy: merge to `main` → CI → `image` workflow (GHCR, tag
+  `main-<sha>-<run_number>`) → Flux image automation on the homelab k3s
+  (maxkuminov/infra `docs/homelab-image-automation.md`). Until the app is cut
+  over there, a digest-bump PR in maxkuminov/infra. Docs-only merges build
+  nothing.
+- `make deploy` (build → scan → push → backup → migrate → recreate) is the
+  compose path, not production.
 
 ## Public repo — host paths live outside the tree
 This repo is published on GitHub. Anything host-specific (paths, secrets,
@@ -52,7 +58,8 @@ hostnames) must stay out of tracked files. The mechanism:
 
 ## Commands
 - `make init` — first-time setup
-- `make deploy` — full build, backup, migration, and deploy
+- `make deploy` — compose-host build, backup, migration, and deploy (production
+  is merge to `main`, see Infrastructure)
 - `make db-init` — create database + pgvector extension
 - `make db-migrate` — run alembic migrations
 - `make db-check` — `alembic check`: schema vs. ORM models (must be clean)
@@ -87,7 +94,7 @@ specific to this MCP server.
 | Schema drift | `make db-check` (`docker exec obsidian-mcp alembic check`) |
 | Schema gate (any change carrying a migration) | `make test-schema` |
 | Integration suite (real Postgres) | `make test-integration` |
-| Deploy | `make deploy` (build, backup, migrate, deploy) |
+| Deploy | merge to `main` → CI → `image` workflow → Flux (homelab k3s); `make deploy` for a compose host |
 
 **`tests/integration/` skips itself without a database.** Those modules are
 guarded on `PGVECTOR_TEST_ADMIN_URL`, so a local `pytest tests` reports green
