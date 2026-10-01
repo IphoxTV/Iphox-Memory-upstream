@@ -1,20 +1,20 @@
 ## 1. Walk and prune protection (D1, D2)
 
-- [ ] 1.1 `discover_markdown_files_at`: record the vault-relative prefix (`""` for the root) for every directory failure already recorded as a skip, and the entry path when `is_dir()` raises; `ScanResult.walk_failed_prefixes`
-- [ ] 1.2 `_index_vault_attempt`: compute protected paths from `locked` (`p == pref` or `p.startswith(pref + "/")`, `pref != ""`); remove them from the prune set before `deleted_by_hash`; skip their quarantine-clear
-- [ ] 1.3 WARNING naming unlisted dirs (bounded) and rows protected; run-record line `walk incomplete: N dir(s) not listed: …` (≤ 5, backslashreplace); `run_outcome` labels it failed; `IndexPassResult` exposes the count
+- [x] 1.1 `discover_markdown_files_at`: record the vault-relative prefix (`""` for the root) for every directory failure already recorded as a skip, and the entry path when `is_dir()` raises; `ScanResult.walk_failed_prefixes`
+- [x] 1.2 `_index_vault_attempt`: compute protected paths from `locked` (`p == pref` or `p.startswith(pref + "/")`, `pref != ""`); remove them from the prune set before `deleted_by_hash`; skip their quarantine-clear
+- [x] 1.3 WARNING naming unlisted dirs (bounded) and rows protected; run-record line `walk incomplete: N dir(s) not listed: …` (≤ 5, backslashreplace); `run_outcome` labels it failed; `IndexPassResult` exposes the count
 
 ## 2. Indeterminate root (D3, D5 consumption)
 
-- [ ] 2.1 `IndexIndeterminate`; raise in `_index_vault_pinned` before the lock on root listing failure, or on empty `seen` with snapshot rows and no unexpired permission
-- [ ] 2.2 Re-evaluate against `locked` in `_index_vault_attempt` before any mutation
-- [ ] 2.3 Empty-prune permission registry `(expires_at, assignment)`; atomic take into an invocation-local authorisation at the first predicate evaluation; locked re-check uses it; expiry + assignment re-check right before prune; kept across quarantine restarts; never returned; WARNING on grant/take and rows pruned
-- [ ] 2.4 Error text per spec (condition + row count + where to confirm; no path)
+- [x] 2.1 `IndexIndeterminate`; raise in `_index_vault_pinned` before the lock on root listing failure, or on empty `seen` with snapshot rows and no unexpired permission
+- [x] 2.2 Re-evaluate against `locked` in `_index_vault_attempt` before any mutation
+- [x] 2.3 Empty-prune permission registry `(expires_at, assignment)`; atomic take into an invocation-local authorisation at the first predicate evaluation; locked re-check uses it; expiry + assignment re-check right before prune; kept across quarantine restarts; never returned; WARNING on grant/take and rows pruned
+- [x] 2.4 Error text per spec (condition + row count + where to confirm; no path)
 
 ## 3. Accounting (D4)
 
-- [ ] 3.1 `indexer_health`: `walk_incomplete` per scope, wired from `IndexPassResult` at every entrypoint; counts toward degraded, `max_consecutive_failures`, CRITICAL once per episode; `failing_scopes` = distinct scopes with index / re-derive / walk counter at threshold
-- [ ] 3.2 Manual single-user reindex: isolate index and embed stages (embed runs after an index failure), as #308 D9 did for the loop
+- [x] 3.1 `indexer_health`: `walk_incomplete` per scope, wired from `IndexPassResult` at every entrypoint; counts toward degraded, `max_consecutive_failures`, CRITICAL once per episode; `failing_scopes` = distinct scopes with index / re-derive / walk counter at threshold
+- [x] 3.2 Manual single-user reindex: isolate index and embed stages (embed runs after an index failure), as #308 D9 did for the loop
 
 ## 4. Panel (D5)
 

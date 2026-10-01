@@ -53,7 +53,7 @@ from src.services.embeddings import (
     embed_note,
 )
 from src.services.fts import index_tsvector_sql
-from src.services import indexer_health
+from src.services import empty_prune, indexer_health
 from src.services.rate_limits import flush_expired
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
@@ -287,6 +287,11 @@ class PassStats:
         quarantined = getattr(result, "quarantined", ())
         if quarantined:
             self.errors.append(format_quarantined(quarantined))
+        # #309 D2: directories the walk could not list. Unlike a quarantine
+        # line this makes the run `failed` — part of the vault was not seen.
+        walk_failed = getattr(result, "walk_failed", ())
+        if walk_failed:
+            self.errors.append(format_walk_incomplete(walk_failed))
 
     def record_embedded(self, result) -> None:
         """Absorb `embed_vault`'s count of notes it actually embedded.
@@ -1061,6 +1066,34 @@ def format_quarantined(paths) -> str:
     )
 
 
+#: How many unlisted directories a run-record line and its WARNING name (#309).
+WALK_FAILURE_REPORT_LIMIT = 5
+
+
+def format_walk_incomplete(prefixes) -> str:
+    """#309 D2's run-record line: the directories the walk could not list.
+
+    Rendered like `format_quarantined` — at most five, then `…`, each through
+    `_loggable_path` with line breaks escaped — so the record is always
+    storable and stays one line. Not a quarantine line, so `run_outcome`
+    labels the run failed (part of the vault was not indexed).
+    """
+    prefixes = list(prefixes)
+    return (
+        f"{indexer_health.WALK_INCOMPLETE_RUN_PREFIX}{len(prefixes)} dir(s) "
+        f"not listed: {_format_dir_list(prefixes)}"
+    )
+
+
+def _format_dir_list(prefixes: list[str]) -> str:
+    shown = [
+        _loggable_path(p).replace("\n", "\\n").replace("\r", "\\r")
+        for p in prefixes[:WALK_FAILURE_REPORT_LIMIT]
+    ]
+    more = ", …" if len(prefixes) > WALK_FAILURE_REPORT_LIMIT else ""
+    return ", ".join(shown) + more
+
+
 async def _savepoint_poison(session, run) -> BaseException | None:
     """Run `await run()` in a savepoint. Returns the exception when it is a
     poison failure **and** the savepoint rolled back cleanly (so the outer
@@ -1775,7 +1808,10 @@ class DiscoveredFile:
 
 
 def discover_markdown_files_at(
-    root_fd: int, *, skips: list[str] | None = None
+    root_fd: int,
+    *,
+    skips: list[str] | None = None,
+    failed_prefixes: list[str] | None = None,
 ) -> Iterator[DiscoveredFile]:
     """Walk the pinned root depth-first, yielding every indexable note.
 
@@ -1793,7 +1829,17 @@ def discover_markdown_files_at(
     A directory that could not be opened for any *other* reason is a genuine
     skip and is appended to `skips` when one is supplied — a re-derive that
     could not visit a subtree has not visited the root it is about to certify.
+
+    `failed_prefixes`, when supplied, receives the vault-relative path of each
+    such directory — `""` for the root's own listing — and of each entry whose
+    type could not be determined (it may be a directory). The pass protects
+    every row at or beneath one of them from its prune (#309, D1/D2): a
+    directory the walk could not see into says nothing about what is in it.
     """
+
+    def failed(prefix: str) -> None:
+        if failed_prefixes is not None:
+            failed_prefixes.append(prefix)
 
     def walk(parent_fd: int, prefix: str) -> Iterator[DiscoveredFile]:
         try:
@@ -1802,6 +1848,7 @@ def discover_markdown_files_at(
         except OSError as e:
             if skips is not None:
                 skips.append(f"{prefix or '.'} (directory: {e})")
+            failed(prefix)
             return
         # Sorted so a pass's discovery order is stable, which keeps the
         # offender report and the move-detection pairing reproducible.
@@ -1812,9 +1859,12 @@ def discover_markdown_files_at(
             rel = f"{prefix}/{name}" if prefix else name
             try:
                 is_dir = entry.is_dir(follow_symlinks=False)
-            except OSError as e:  # pragma: no cover - dirent type is cached
+            except OSError as e:  # dirent type is normally cached
                 if skips is not None:
                     skips.append(f"{rel} ({e})")
+                # Possibly a directory: its path and subtree are protected
+                # (#309, codex spec r1 B1).
+                failed(rel)
                 continue
             if is_dir:
                 try:
@@ -1827,11 +1877,10 @@ def discover_markdown_files_at(
                     # ELOOP/ENOTDIR: a directory symbolic link, or a directory
                     # that vanished. `rglob` declines to descend the former and
                     # silently drops the latter; neither is a skip.
-                    if (
-                        e.errno not in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT)
-                        and skips is not None
-                    ):
-                        skips.append(f"{rel} (directory: {e})")
+                    if e.errno not in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT):
+                        if skips is not None:
+                            skips.append(f"{rel} (directory: {e})")
+                        failed(rel)
                     continue
                 try:
                     yield from walk(child_fd, rel)
@@ -2088,6 +2137,11 @@ class ScanResult:
     #: withholds a re-derive's stamp unconditionally: anything beneath it could
     #: have a row (#308, D8).
     walk_failures: list[str] = field(default_factory=list)
+    #: The vault-relative prefix of each directory in `walk_failures` (`""`
+    #: for the root itself), plus each entry whose type could not be
+    #: determined (#309, D1). Rows at or beneath a non-root prefix are neither
+    #: pruned nor move-paired (D2); the root prefix aborts the pass (D3).
+    walk_failed_prefixes: list[str] = field(default_factory=list)
     #: `(rel, skip entry)` for each file whose read raised. It withholds a
     #: re-derive's stamp only if the **locked** rows have that path — decided
     #: under the lock, not here (D8).
@@ -2158,7 +2212,10 @@ def _scan_vault(
     # and appended to both lists once the walk is drained (a scan that raises
     # instead is discarded whole).
     walk_failures: list[str] = []
-    walk = discover_markdown_files_at(root_fd, skips=walk_failures)
+    walk_failed_prefixes: list[str] = []
+    walk = discover_markdown_files_at(
+        root_fd, skips=walk_failures, failed_prefixes=walk_failed_prefixes
+    )
     with contextlib.closing(walk):
         for found in walk:
             if stop.is_set():
@@ -2226,6 +2283,7 @@ def _scan_vault(
     result.skips.extend(walk_failures)
     result.unverified.extend(walk_failures)
     result.walk_failures.extend(walk_failures)
+    result.walk_failed_prefixes.extend(walk_failed_prefixes)
     return result
 
 
@@ -2471,11 +2529,18 @@ class IndexPassResult(tuple):
     - `quarantined`: the sorted paths this pass excluded because they are
       quarantined (D3) — newly or from an earlier pass. The run record names
       them (D5); they do not make the pass a failure.
+    - `walk_failed`: the sorted, distinct directories beneath the root the walk
+      could not list (or whose type it could not determine) (#309, D2). Rows
+      beneath them were protected from the prune; the run record names them
+      and `walk_incomplete` counts the pass toward degradation.
+    - `walk_protected`: how many locked rows that protection kept.
     """
 
     rederive: str | None
     not_indexable: int
     quarantined: tuple[str, ...]
+    walk_failed: tuple[str, ...]
+    walk_protected: int
 
     def __new__(
         cls,
@@ -2485,11 +2550,15 @@ class IndexPassResult(tuple):
         rederive: str | None = None,
         not_indexable: int = 0,
         quarantined: tuple[str, ...] = (),
+        walk_failed: tuple[str, ...] = (),
+        walk_protected: int = 0,
     ):
         obj = super().__new__(cls, (notes_scanned, notes_indexed))
         obj.rederive = rederive
         obj.not_indexable = not_indexable
         obj.quarantined = tuple(quarantined)
+        obj.walk_failed = tuple(walk_failed)
+        obj.walk_protected = walk_protected
         return obj
 
     @property
@@ -2503,6 +2572,93 @@ class IndexPassResult(tuple):
     @property
     def rederive_incomplete(self) -> bool:
         return self.rederive == REDERIVE_INCOMPLETE
+
+    @property
+    def walk_incomplete(self) -> bool:
+        return bool(self.walk_failed)
+
+
+class IndexIndeterminate(RuntimeError):
+    """The pass cannot tell an empty vault from a missing one (#309, D3).
+
+    Raised before any mutation when the vault root itself could not be listed,
+    or when the walk found no markdown file while the scope's index holds rows
+    and no unexpired empty-prune permission (`empty_prune`) authorises the
+    prune. Nothing is written. It is an ordinary failed pass to every caller:
+    the run row is failed and `indexer_health` counts it. The message states
+    the condition and the row count, never a path.
+    """
+
+
+#: Where an operator grants the empty-prune permission — the text every
+#: `IndexIndeterminate` for an empty root points at.
+_EMPTY_ROOT_REMEDY = (
+    "If the vault was emptied on purpose, confirm it in the panel "
+    "(Settings → Danger zone, or the user's page)."
+)
+
+
+def _indeterminate_root_unlistable(rows: int) -> IndexIndeterminate:
+    return IndexIndeterminate(
+        "vault root could not be listed; the index holds "
+        f"{rows} note(s) and nothing was deleted."
+    )
+
+
+def _indeterminate_root_empty(rows: int) -> IndexIndeterminate:
+    return IndexIndeterminate(
+        f"vault root is empty but the index holds {rows} note(s); nothing "
+        f"was deleted. {_EMPTY_ROOT_REMEDY}"
+    )
+
+
+def _check_determinate(
+    *,
+    walk_failed_prefixes,
+    seen,
+    rows: int,
+    auth: "empty_prune.Authorisation | None",
+    assignment: str,
+) -> None:
+    """D3's predicate, over the pre-lock snapshot or the locked rows.
+
+    Raises `IndexIndeterminate` when the root's own listing failed (whatever
+    the permission says), or when the walk found no markdown file, the rows
+    are non-empty and `auth` is not an unexpired permission granted for
+    `assignment`. A scope with no rows is never refused.
+    """
+    if "" in walk_failed_prefixes:
+        raise _indeterminate_root_unlistable(rows)
+    if seen or not rows:
+        return
+    if auth is not None and auth.valid_for(assignment):
+        return
+    raise _indeterminate_root_empty(rows)
+
+
+def _walk_protected(locked_paths, walk_failed_prefixes) -> set[str]:
+    """The locked paths at or beneath a non-root failed prefix (#309, D2).
+
+    `sub` protects `sub` and `sub/…` but not `subway.md`. The root prefix
+    `""` is excluded here — it aborts the pass instead (D3).
+    """
+    prefixes = {p for p in walk_failed_prefixes if p != ""}
+    if not prefixes:
+        return set()
+    protected: set[str] = set()
+    for path in locked_paths:
+        if path in prefixes:
+            protected.add(path)
+            continue
+        # Every proper ancestor of `path`, checked against the set: O(depth)
+        # per row rather than O(prefixes).
+        cut = path.rfind("/")
+        while cut > 0:
+            if path[:cut] in prefixes:
+                protected.add(path)
+                break
+            cut = path.rfind("/", 0, cut)
+    return protected
 
 
 async def index_vault(user_id: int | None = None, *, full_hash: bool = False):
@@ -2693,6 +2849,23 @@ async def _index_vault_pinned(
         f"{scan.shortcut} unchanged by stat"
     )
 
+    # ── An indeterminate root (#309, D3) ──────────────────────────────────
+    # The empty-prune permission is taken here, at the first evaluation of
+    # the predicate, whether or not the root is empty: it is single-use, and
+    # a permission left for later would authorise an emptying nobody
+    # confirmed. It lives on as this invocation's `auth` — across quarantine
+    # restarts, never back into the registry — and the locked re-check and
+    # the prune use it, not the registry.
+    assignment = canonical_vault_root(vault)
+    auth = empty_prune.take(user_id)
+    _check_determinate(
+        walk_failed_prefixes=scan.walk_failed_prefixes,
+        seen=seen,
+        rows=len(snapshot),
+        auth=auth,
+        assignment=assignment,
+    )
+
     # ── The mutation phase, re-run on a poison note (#308, D3) ────────────
     # Each attempt is one transaction from the generation lock to the commit.
     # A `PoisonNote` rolls the whole attempt back (the session closes without
@@ -2719,6 +2892,8 @@ async def _index_vault_pinned(
                 skips=list(skips),
                 withholding=list(withholding),
                 unverified=list(unverified),
+                auth=auth,
+                assignment=assignment,
             )
         except PoisonNote as poison:
             for note in poison.notes:
@@ -2758,6 +2933,8 @@ async def _index_vault_attempt(
     skips: list[str],
     withholding: list[str],
     unverified: list[str],
+    auth: "empty_prune.Authorisation | None" = None,
+    assignment: str | None = None,
 ) -> "IndexPassResult":
     """One transaction of `_index_vault_pinned`: classification under the
     generation lock through the commit. Raises `PoisonNote` (after which
@@ -2824,6 +3001,42 @@ async def _index_vault_attempt(
         # Kept beside `existing` rather than folded into it: that dict is the
         # move-detection input, keyed and reverse-keyed by content hash alone.
         stamped_version = {p: r.extraction_version for p, r in locked.items()}
+
+        # #309 D3, re-evaluated against the locked rows before any mutation:
+        # a note may have been written into the empty scope between the
+        # snapshot and the lock. Same taken authorisation as the pre-lock
+        # check; raising here rolls back a transaction that wrote nothing.
+        if assignment is None:
+            assignment = canonical_vault_root(vault)
+        _check_determinate(
+            walk_failed_prefixes=scan.walk_failed_prefixes,
+            seen=seen,
+            rows=len(locked),
+            auth=auth,
+            assignment=assignment,
+        )
+        # A permitted empty-root prune: every locked row is about to go, on
+        # the strength of `auth` alone, re-checked again just before the
+        # delete.
+        empty_prune_relied = not seen and bool(locked)
+
+        # #309 D2: a row at or beneath a directory the walk could not list is
+        # protected — never pruned, never a move source, its quarantine entry
+        # never cleared for being unseen. Decided against the locked rows.
+        walk_failed = sorted(
+            {p for p in scan.walk_failed_prefixes if p != ""}
+        )
+        protected = _walk_protected(locked, walk_failed)
+        if walk_failed:
+            logger.warning(
+                "Walk incomplete%s: %d director(y/ies) could not be listed "
+                "(%s); %d indexed note(s) beneath them are kept as they are, "
+                "neither pruned nor paired as a move.",
+                log_suffix,
+                len(walk_failed),
+                _format_dir_list(walk_failed),
+                len(protected),
+            )
 
         # C4: a walked path whose locked row differs from its snapshot row in
         # presence, hash, extraction marker or stat — another process's pass,
@@ -3070,7 +3283,7 @@ async def _index_vault_attempt(
         # is gone. It is deferred to the next pass (perf-L7), and under a
         # re-derive the deferral is a skip, so A.7a withholds the stamp.
         deleted_paths: set[str] = set()
-        for p in set(existing.keys()) - seen:
+        for p in set(existing.keys()) - seen - protected:
             if snapshot.get(p) == locked[p]:
                 deleted_paths.add(p)
                 continue
@@ -3461,6 +3674,18 @@ async def _index_vault_attempt(
         # Remove deleted files (scoped to this user when set). `deleted_paths`
         # was computed earlier and any entries that turned out to be moves
         # have already been stripped out by the move-detection block above.
+        if deleted_paths and empty_prune_relied:
+            # The last moment before an empty-root prune (#309, D5): the
+            # permission must still be unexpired and the scope still assigned
+            # the root it was granted for — a lock wait or an administrator's
+            # reassignment since the take authorises nothing.
+            await _recheck_empty_prune(session, user_id, auth, len(locked))
+            logger.warning(
+                "Empty-prune permission used%s: pruning %d indexed note(s) "
+                "of a vault root confirmed empty",
+                log_suffix,
+                len(deleted_paths),
+            )
         if deleted_paths:
             del_stmt = delete(NoteMetadata).where(
                 NoteMetadata.file_path.in_(deleted_paths)
@@ -3643,6 +3868,10 @@ async def _index_vault_attempt(
     for rel in quarantined_paths(user_id):
         if rel in still_quarantined:
             continue
+        if rel in protected:
+            # #309 D2: unseen because its directory was not listed, not
+            # because it is gone.
+            continue
         if rel in written or rel not in seen or rel in scan.not_indexable:
             clear_quarantine(user_id, rel)
 
@@ -3657,7 +3886,36 @@ async def _index_vault_attempt(
         rederive=rederive,
         not_indexable=len(scan.not_indexable) - len(quarantined_now),
         quarantined=tuple(quarantined_now),
+        walk_failed=tuple(walk_failed),
+        walk_protected=len(protected),
     )
+
+
+async def _recheck_empty_prune(
+    session, user_id: int | None, auth, rows: int
+) -> None:
+    """Raise `IndexIndeterminate` unless `auth` still authorises the prune.
+
+    Expiry against the clock now, and the assignment as it stands now: the
+    configured root in single-user mode, the `users` row in multi-user mode
+    (a plain read — this transaction already holds `notes_metadata` row
+    locks, so it must not wait on `users`; see `_assert_still_assigned`).
+    """
+    if auth is None or auth.expired():
+        raise _indeterminate_root_empty(rows)
+    if user_id is None:
+        current = canonical_vault_root(settings.vault_path)
+    else:
+        row = (
+            await session.execute(
+                select(User.vault_path, User.is_active).where(User.id == user_id)
+            )
+        ).first()
+        if row is None or not row.is_active or row.vault_path is None:
+            raise _indeterminate_root_empty(rows)
+        current = canonical_vault_root(row.vault_path)
+    if current != auth.assignment:
+        raise _indeterminate_root_empty(rows)
 
 
 async def _update_links_for_changed(
@@ -6813,14 +7071,19 @@ def record_index_outcome(user_id: int | None, ok: bool, result=None) -> None:
     whichever path ran the pass. `ok` means `index_vault` returned without
     raising (a pass that quarantined a note returned, so it counts as ok).
     `result` is what it returned; its `rederive` verdict (D8) feeds the
-    incomplete-re-derive counter. Anything else (a test's no-op stub) is
-    recorded as "not a re-derive".
+    incomplete-re-derive counter, and its `walk_failed` (#309, D4) the
+    incomplete-walk counter. Anything else (a test's no-op stub) is recorded
+    as "not a re-derive" and a complete walk. A pass that raised leaves both
+    counters as they were: they describe committed passes.
     """
     indexer_health.record_index(user_id, ok)
     if ok:
         verdict = getattr(result, "rederive", None)
         indexer_health.record_rederive(
             user_id, _REDERIVE_HEALTH.get(verdict, None)
+        )
+        indexer_health.record_walk(
+            user_id, bool(getattr(result, "walk_failed", ()))
         )
 
 
@@ -6835,7 +7098,9 @@ def record_embed_outcome(
     indexer_health.record_embed(user_id, 1 if raised else _embed_failures(result))
 
 
-async def _index_pass_once(user_id: int | None, trigger: str = "scheduled") -> bool:
+async def _index_pass_once(
+    user_id: int | None, trigger: str = "scheduled", *, full_hash: bool = False
+) -> bool:
     """One full index + embed pass for a single user (or single-user mode).
 
     Returns True only if both stages completed. Failures are swallowed per
@@ -6858,7 +7123,12 @@ async def _index_pass_once(user_id: int | None, trigger: str = "scheduled") -> b
     ok = True
     async with record_indexer_run(trigger, user_id) as stats:
         try:
-            index_result = await index_vault(user_id=user_id)
+            # `full_hash` only when asked: the plain call is the tick's.
+            index_result = await (
+                index_vault(user_id=user_id, full_hash=True)
+                if full_hash
+                else index_vault(user_id=user_id)
+            )
             stats.record_index(index_result)
         except Exception as e:
             ok = False
@@ -6878,6 +7148,34 @@ async def _index_pass_once(user_id: int | None, trigger: str = "scheduled") -> b
             stats.record_embedded(embedded)
             record_embed_outcome(user_id, embedded)
     return ok
+
+
+async def index_scope_now(user_id: int | None, *, trigger: str = "manual") -> bool:
+    """One full-hash index pass and its embed stage for **one** scope (#309, D5).
+
+    The background pass the panel's "Confirm vault is empty" starts after it
+    grants the empty-prune permission: it touches exactly `user_id`'s scope
+    (`None` in single-user mode), unlike `_reindex_background`, which fans out
+    to every active user. Same shape as a tick for that scope — overlap
+    detection before `index_pass_lock` (E4: the check must not queue behind
+    the pass it gates), then `_index_pass_once` under the lock, with its
+    per-stage isolation, quarantine recovery, run row under `trigger` and
+    `indexer_health` accounting.
+
+    Returns True only if both stages completed. Raises `ValueError` for a
+    `None` scope in multi-user mode, which has no ownerless vault.
+    """
+    if settings.multi_user_mode and user_id is None:
+        raise ValueError("multi-user mode has no single-user scope to index")
+    await detect_root_overlaps("panel scope pass")
+    async with index_pass_lock:
+        if user_id is not None:
+            # The per-user vault cache is warmed per pass, as
+            # `_active_user_ids` does for the loop; an unassigned or inactive
+            # user then fails the pass at `_vault_root`, recorded as usual.
+            async with async_session() as session:
+                await warm_user_vault_cache(session, user_id=user_id)
+        return await _index_pass_once(user_id, trigger, full_hash=True)
 
 
 async def run_indexer_loop():

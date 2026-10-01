@@ -16,6 +16,8 @@ can read it.
   raised); reset by one with none;
 - `rederive_incomplete`: a committed re-derive that withheld its provenance
   stamp; reset by one that recorded it, or by a pass that was not a re-derive;
+- `walk_incomplete`: a committed pass that could not list one or more
+  directories beneath the root (#309, D4); reset by one that listed them all;
 - `last_success_at` / `last_failure_at` of the index stage.
 
 **Process-wide**: consecutive tick-level failures not attributable to a scope
@@ -50,6 +52,7 @@ Scope = int | None
 _INDEX = "index"
 _EMBED = "embed"
 _REDERIVE = "rederive"
+_WALK = "walk"
 
 #: The start of the run-record line a pass that quarantined notes writes into
 #: `indexer_runs.error` (#308, D5). Produced by `indexer.format_quarantined`
@@ -58,6 +61,11 @@ QUARANTINED_RUN_PREFIX = "quarantined "
 _QUARANTINED_RUN_LINE = re.compile(
     re.escape(QUARANTINED_RUN_PREFIX) + r"\d+ note\(s\): "
 )
+
+#: The start of the run-record line a pass that could not list a directory
+#: writes (#309, D2). Produced by `indexer.format_walk_incomplete`. Not
+#: recognised as a quarantine line, so such a run is labelled `failed`.
+WALK_INCOMPLETE_RUN_PREFIX = "walk incomplete: "
 
 RUN_OK = "ok"
 RUN_QUARANTINED = "quarantined"
@@ -87,6 +95,7 @@ class ScopeHealth:
     index_consecutive_failures: int = 0
     embed_consecutive_failures: int = 0
     rederive_incomplete: int = 0
+    walk_incomplete: int = 0
     last_success_at: datetime | None = None
     last_failure_at: datetime | None = None
     #: Counters whose CRITICAL line has fired this episode.
@@ -177,6 +186,16 @@ def record_rederive(scope: Scope, complete: bool | None) -> None:
         _reset(state, _REDERIVE, "rederive_incomplete")
 
 
+def record_walk(scope: Scope, incomplete: bool) -> None:
+    """A committed pass's walk: `incomplete` when it could not list one or
+    more directories beneath the root (#309, D4); a complete walk resets."""
+    state = _scope(scope)
+    if incomplete:
+        _bump(scope, state, _WALK, "walk_incomplete", "walk")
+    else:
+        _reset(state, _WALK, "walk_incomplete")
+
+
 def record_enumeration(ok: bool) -> None:
     """One tick's scope-independent work succeeded (`ok`) or failed."""
     global _enumeration_failures, _enumeration_alerted
@@ -238,11 +257,21 @@ def snapshot() -> dict:
     """The `/health` `indexer` object. Counts only — nothing identifying."""
     threshold = _threshold()
     states = list(_scopes.values())
-    failing = sum(1 for s in states if s.index_consecutive_failures >= threshold)
+    # Distinct scopes with any index-side counter at the threshold (#309,
+    # D4): a scope failing its index *and* its walk is one failing scope.
+    failing = sum(
+        1
+        for s in states
+        if max(
+            s.index_consecutive_failures,
+            s.rederive_incomplete,
+            s.walk_incomplete,
+        )
+        >= threshold
+    )
     embed_failing = sum(
         1 for s in states if s.embed_consecutive_failures >= threshold
     )
-    rederive_failing = any(s.rederive_incomplete >= threshold for s in states)
     max_failures = max(
         [_enumeration_failures]
         + [
@@ -250,6 +279,7 @@ def snapshot() -> dict:
                 s.index_consecutive_failures,
                 s.embed_consecutive_failures,
                 s.rederive_incomplete,
+                s.walk_incomplete,
             )
             for s in states
         ]
@@ -261,7 +291,6 @@ def snapshot() -> dict:
     degraded = (
         failing > 0
         or embed_failing > 0
-        or rederive_failing
         or _enumeration_failures >= threshold
         or quarantined > 0
         or (not _task_running and not _disabled)
