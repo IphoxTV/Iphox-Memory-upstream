@@ -262,7 +262,14 @@ def test_the_run_record_names_the_directories_and_reads_failed():
     dirs = [f"d{i}" for i in range(7)] + ["new\nline"]
     line = format_walk_incomplete(dirs)
     assert line.startswith("walk incomplete: 8 dir(s) not listed: d0, d1")
-    assert line.endswith(", …") and "\n" not in line
+    assert line.endswith("d4 (+3 more)") and "\n" not in line
+    assert "…" not in line
+    # Exactly at the limit: no remainder marker.
+    assert format_walk_incomplete([f"d{i}" for i in range(5)]).endswith("d3, d4")
+    # The WARNING renders through the same helper: escapes and remainder.
+    assert indexer._format_dir_list(["a\rb"] + [f"x{i}" for i in range(5)]) == (
+        "a\\rb, x0, x1, x2, x3 (+1 more)"
+    )
     stats = PassStats()
     stats.record_index(IndexPassResult(5, 2, walk_failed=("bad\udce9",)))
     assert stats.error_text == "walk incomplete: 1 dir(s) not listed: bad\\udce9"

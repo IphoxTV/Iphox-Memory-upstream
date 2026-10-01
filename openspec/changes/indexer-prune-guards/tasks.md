@@ -23,12 +23,12 @@
 
 ## 5. Tests (D6)
 
-- [ ] 5.1 Unit tests per design D6 (panel part done: `tests/test_issue_309_panel_confirm_empty.py`, CSP route/template inventories)
-- [ ] 5.2 Real-Postgres tests per design D6
+- [x] 5.1 Unit tests per design D6 (panel part done: `tests/test_issue_309_panel_confirm_empty.py`, CSP route/template inventories)
+- [x] 5.2 Real-Postgres tests per design D6
 
 ## 6. Docs
 
-- [ ] 6.1 `docs/architecture/indexing-and-embeddings.md` (prefix protection, indeterminate root, permission), `docs/architecture/control-panel.md` (the new action — done), `DEPLOYMENT.md` pitfall + L1, `docs/deployment-kubernetes.md` troubleshooting row, `CLAUDE.md` key-decisions bullet
+- [x] 6.1 `docs/architecture/indexing-and-embeddings.md` (prefix protection, indeterminate root, permission), `docs/architecture/control-panel.md` (the new action — done), `DEPLOYMENT.md` pitfall + L1, `docs/deployment-kubernetes.md` troubleshooting row, `CLAUDE.md` key-decisions bullet
 
 ## 7. Gates
 

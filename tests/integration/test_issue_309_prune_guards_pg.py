@@ -453,3 +453,92 @@ async def test_index_scope_now_touches_only_its_scope(
     finally:
         vault_service.clear_user_vault_cache(user_id=a)
         vault_service.clear_user_vault_cache(user_id=b)
+
+
+async def test_a_permission_that_expires_during_the_assignment_read_authorises_nothing(
+    sessionmaker, vault, monkeypatch
+):
+    """Review r1 (Codex C2/C3): the decisive check follows every await.
+
+    The clock passes expiry while the re-check is awaiting the `users` read,
+    after any expiry test placed before that await would have passed.
+    """
+    import sys
+
+    from sqlalchemy.ext.asyncio import AsyncSession as _Session
+
+    a_root = vault / "t"
+    a = await tenant(sessionmaker, a_root, "expiring")
+    try:
+        write(a_root, "x.md", "x\n")
+        write(a_root, "y.md", "y\n")
+        await indexer.index_vault(user_id=a)
+        await indexer.embed_vault(user_id=a)
+        before = await rows(sessionmaker, a)
+        ids = [r.id for r in before.values()]
+        embedded = await embedding_count(sessionmaker, ids)
+        assert embedded >= 2
+        empty(a_root)
+
+        now = [1000.0]
+        monkeypatch.setattr(empty_prune, "_clock", lambda: now[0])
+        empty_prune.grant(a, canonical_vault_root(a_root))
+
+        real_execute = _Session.execute
+        advanced: list[bool] = []
+
+        async def execute(self, statement, *args, **kwargs):
+            frame = sys._getframe(1)
+            while frame is not None:
+                if frame.f_code.co_name == "_recheck_empty_prune":
+                    if not advanced:
+                        advanced.append(True)
+                        result = await real_execute(self, statement, *args, **kwargs)
+                        now[0] += empty_prune.DEFAULT_TTL_SECONDS + 1
+                        return result
+                    break
+                frame = frame.f_back
+            return await real_execute(self, statement, *args, **kwargs)
+
+        monkeypatch.setattr(_Session, "execute", execute)
+        with pytest.raises(indexer.IndexIndeterminate):
+            await indexer.index_vault(user_id=a)
+        assert advanced, "the re-check's assignment read was reached"
+        after = await rows(sessionmaker, a)
+        assert set(after) == set(before)
+        assert {p: r.id for p, r in after.items()} == {p: r.id for p, r in before.items()}
+        assert await embedding_count(sessionmaker, ids) == embedded
+        assert not empty_prune.pending(a)
+    finally:
+        vault_service.clear_user_vault_cache(user_id=a)
+
+
+@pytest.mark.skipif(running_as_root, reason="root ignores directory modes")
+async def test_a_quarantine_entry_beneath_an_unlisted_directory_is_kept(
+    sessionmaker, vault
+):
+    """Verifier r1: the "not seen" sweep spares entries under a failed prefix,
+    and clears them once the directory is listed and the note is gone."""
+    write(vault, "sub/bad.md", "bad body\n")
+    write(vault, "top.md", "top\n")
+    await indexer.index_vault()
+    bad = (await rows(sessionmaker))["sub/bad.md"]
+    indexer._quarantine_note(None, indexer.PoisonCandidate(
+        "sub/bad.md", bad.content_hash, "22021", "row"
+    ))
+    # Quarantined by the next pass: its row is pruned, its entry stays.
+    await indexer.index_vault()
+    assert "sub/bad.md" not in await rows(sessionmaker)
+    assert indexer.quarantined_paths(None) == ["sub/bad.md"]
+
+    with unreadable(vault / "sub"):
+        result = await indexer.index_vault()
+    assert result.walk_failed == ("sub",)
+    assert indexer.quarantined_paths(None) == ["sub/bad.md"], (
+        "unseen because its directory was not listed, not because it is gone"
+    )
+
+    (vault / "sub" / "bad.md").unlink()
+    result = await indexer.index_vault()
+    assert result.walk_failed == ()
+    assert indexer.quarantined_paths(None) == []

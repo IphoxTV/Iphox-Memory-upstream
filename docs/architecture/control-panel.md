@@ -776,7 +776,10 @@ action is how an administrator says it was on purpose.
   — which logs the WARNING with the administrator and the scope — then
   `_spawn` starts `indexer.index_scope_now(scope)`: one full-hash pass and
   its embed stage for **that scope only**. `_reindex_background` (Reindex
-  Now, re-embed, reset) is untouched and still fans out to every active user.
+  Now, re-embed, reset) keeps its callers and still fans out to every active
+  user in multi-user mode; its single-user branch now isolates the index and
+  embed stages, so an indeterminate index stage does not stop the embed stage
+  over committed rows (#309 task 3.2).
   A refusal logs a WARNING with the reason and flashes it; the outcome lands
   as a session flash on the settings or user page (settings gained the flash
   block for this).

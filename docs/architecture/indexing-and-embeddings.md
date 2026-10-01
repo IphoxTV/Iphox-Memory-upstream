@@ -828,10 +828,12 @@ runs were recorded clean.
   if `p == pref` or `p.startswith(pref + "/")` for a non-root prefix — so `sub`
   protects `sub/a.md` and `sub/x/b.md` but not `subway.md` (`_walk_protected`).
   Protected paths leave the prune set **before** `deleted_by_hash` is built, so
-  they are neither deleted nor a move source, and the quarantine sweep does not
-  clear their entries for being unseen. Everything else commits. One WARNING
-  names the directories (at most five, then `…`) and the rows kept; the run
-  record gains `walk incomplete: N dir(s) not listed: <dir>, …` (`backslash
+  they are neither deleted nor a move source. The quarantine sweep does not
+  clear an entry beneath a failed prefix for being unseen — decided by prefix
+  over the entries, since a quarantined note's row was already pruned and is
+  never among the protected rows. Everything else commits. One WARNING
+  names the directories (at most five, then `(+N more)`) and the rows kept; the
+  run record gains `walk incomplete: N dir(s) not listed: <dir>, … (+N more)` (`backslash
   replace`, line breaks escaped, like the quarantine line), which `run_outcome`
   labels **failed** — part of the vault was not indexed. `IndexPassResult`
   carries `walk_failed` and `walk_protected`. A folder that stays unreadable

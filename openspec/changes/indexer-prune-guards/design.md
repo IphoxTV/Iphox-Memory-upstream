@@ -40,7 +40,7 @@ In `_index_vault_attempt`, before move pairing, a path `p` from `locked` is **pr
 
 - *Why not abort the whole pass on any subdirectory failure:* one unreadable folder would then stop indexing for the whole vault — the #308 failure class. Protecting the subtree costs nothing elsewhere.
 - *Why prefix match on `/`:* `sub` must protect `sub/a.md` and `sub/x/b.md` but not `subway.md`.
-- The pass logs one WARNING naming the failed directories (bounded list) and the number of rows protected. The run record's `error` gains a line `walk incomplete: N dir(s) not listed: <dir>, …` (≤ 5, then `…`, backslashreplace-rendered as for D5 of #308), and `run_outcome` labels such a run **failed** (it is: part of the vault was not indexed).
+- The pass logs one WARNING naming the failed directories (bounded list) and the number of rows protected. The run record's `error` gains a line `walk incomplete: N dir(s) not listed: <dir>, …` (≤ 5, then `(+N more)`, backslashreplace-rendered as for D5 of #308), and `run_outcome` labels such a run **failed** (it is: part of the vault was not indexed).
 - The scope's new `walk_incomplete` counter (D4) is incremented by a committed pass with any non-root failed prefix and reset by a pass with none.
 
 ### D3. An unlistable root, or an empty root over an existing index, is indeterminate
@@ -98,6 +98,12 @@ No schema change. Deploy via the k3s image bump. Rollback: previous image.
 ## Spec review round 1 (Codex) — disposition
 
 All eight findings accepted (round 2 verified seven and found the token replay-after-restart gap, closed by the process-epoch binding in D5): B1 (type-lookup failures protect their subtree), M1 (provenance discard stated as an exception), M2 (dedicated, bound, single-use token), M3 (invocation-local authorisation with expiry re-check), M4 (targeted pass and eligibility), m1 (manual single-user stage isolation), m2 (`failing_scopes` defined once), m3 (test sequence corrected).
+
+## Implementation review round 1 — disposition
+
+- **Codex C2/C3 (expiry checked before an await) — fixed (F1).** `_recheck_empty_prune` checked expiry before awaiting the multi-user assignment read and only the assignment after it, so a permission expiring during that read still authorised the DELETE. The decisive check is now `auth.valid_for(current_assignment)` — expiry and assignment together — as the last statement after every await, and the prune statement follows with no await in between. Regression: `test_a_permission_that_expires_during_the_assignment_read_authorises_nothing` (real Postgres, clock advanced inside the read; fails on the previous order).
+- **Verifier items — fixed (F2–F4).** F2: a quarantined note has no row (it is pruned when quarantined), so the D2 sweep exemption keyed on the protected *rows* never applied to it; the exemption is now decided by prefix over the quarantine entries themselves, with a real-Postgres test that the entry survives an unlisted directory and is cleared once the directory is readable and the note gone. F3: the unlisted-directory list (WARNING and run record) ends `(+N more)` instead of a bare ellipsis; the index-integrity delta says "a count of the remainder" for the run record too. F4: `control-panel.md` no longer calls `_reindex_background` untouched — its callers and all-user fan-out are unchanged, its single-user branch isolates the index and embed stages (task 3.2).
+- **Verifier notes — accepted by design.** The single-user confirmation token binds a sentinel administrator (single-user mode has one administrator). A permission whose pass is refused before it evaluates the D3 predicate (overlap quarantine, unopenable root) is not taken and stays pending until its 15-minute expiry.
 
 ## Open Questions
 

@@ -1073,7 +1073,7 @@ WALK_FAILURE_REPORT_LIMIT = 5
 def format_walk_incomplete(prefixes) -> str:
     """#309 D2's run-record line: the directories the walk could not list.
 
-    Rendered like `format_quarantined` — at most five, then `…`, each through
+    Rendered like `format_quarantined` — at most five, then `(+N more)`, each through
     `_loggable_path` with line breaks escaped — so the record is always
     storable and stays one line. Not a quarantine line, so `run_outcome`
     labels the run failed (part of the vault was not indexed).
@@ -1090,7 +1090,8 @@ def _format_dir_list(prefixes: list[str]) -> str:
         _loggable_path(p).replace("\n", "\\n").replace("\r", "\\r")
         for p in prefixes[:WALK_FAILURE_REPORT_LIMIT]
     ]
-    more = ", …" if len(prefixes) > WALK_FAILURE_REPORT_LIMIT else ""
+    remainder = len(prefixes) - WALK_FAILURE_REPORT_LIMIT
+    more = f" (+{remainder} more)" if remainder > 0 else ""
     return ", ".join(shown) + more
 
 
@@ -3865,12 +3866,17 @@ async def _index_vault_attempt(
     # does one whose file this pass could not read — nothing is known.
     written = {n["file_path"] for n in to_upsert} | moved_new_paths
     still_quarantined = set(quarantined_now)
-    for rel in quarantined_paths(user_id):
+    entries = quarantined_paths(user_id)
+    # #309 D2, decided by prefix rather than by `protected`: a quarantined
+    # note's row was pruned when it was quarantined, so it is never a locked
+    # row and `protected` never holds it.
+    entries_protected = _walk_protected(entries, walk_failed)
+    for rel in entries:
         if rel in still_quarantined:
             continue
-        if rel in protected:
-            # #309 D2: unseen because its directory was not listed, not
-            # because it is gone.
+        if rel in entries_protected:
+            # Unseen because its directory was not listed, not because it
+            # is gone.
             continue
         if rel in written or rel not in seen or rel in scan.not_indexable:
             clear_quarantine(user_id, rel)
@@ -3900,8 +3906,12 @@ async def _recheck_empty_prune(
     configured root in single-user mode, the `users` row in multi-user mode
     (a plain read — this transaction already holds `notes_metadata` row
     locks, so it must not wait on `users`; see `_assert_still_assigned`).
+
+    The decisive check is the last statement, after every await: an
+    expiry that falls during the assignment read authorises nothing. The
+    caller issues the DELETE with no await in between.
     """
-    if auth is None or auth.expired():
+    if auth is None:
         raise _indeterminate_root_empty(rows)
     if user_id is None:
         current = canonical_vault_root(settings.vault_path)
@@ -3914,7 +3924,8 @@ async def _recheck_empty_prune(
         if row is None or not row.is_active or row.vault_path is None:
             raise _indeterminate_root_empty(rows)
         current = canonical_vault_root(row.vault_path)
-    if current != auth.assignment:
+    # Expiry and assignment together, with no await after this line.
+    if not auth.valid_for(current):
         raise _indeterminate_root_empty(rows)
 
 

@@ -10,6 +10,7 @@ granted and nothing started.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import re
 
@@ -302,7 +303,24 @@ def test_non_admin_is_refused(client_as, multi_user, path, _clean):
     assert _clean["spawned"] == []
 
 
-def test_settings_control_and_user_edit_control_render_for_admin(client_as):
+def test_settings_control_and_user_edit_control_render_for_admin(client_as, monkeypatch):
+    # The settings page probes the embedding provider; keep it offline.
+    probed: list[str] = []
+
+    class _Resp:
+        status_code = 200
+
+    class _Client:
+        async def get(self, url, *a, **k):
+            probed.append(url)
+            return _Resp()
+
+    @contextlib.asynccontextmanager
+    async def _offline_client(*_a, **_k):
+        yield _Client()
+
+    monkeypatch.setattr(panel_routes.settings, "embedding_provider", "ollama")
+    monkeypatch.setattr(panel_routes, "embedding_http_client", _offline_client)
     client = client_as(_user(1, admin=True), False)
     body = client.get("/admin/settings").text
     assert 'href="/admin/settings/confirm-empty-vault"' in body
@@ -312,6 +330,9 @@ def test_settings_control_and_user_edit_control_render_for_admin(client_as):
     assert "/admin/settings/confirm-empty-vault" not in body
     body = client.get("/admin/users/1/edit").text
     assert 'href="/admin/users/1/confirm-empty-vault"' in body
+    assert probed and all(u.endswith("/api/tags") for u in probed), (
+        "every settings render went through the offline stub"
+    )
 
 
 # ── redemption ──────────────────────────────────────────────────────────────
