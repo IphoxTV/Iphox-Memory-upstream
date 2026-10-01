@@ -204,9 +204,9 @@ def count_reads(monkeypatch):
     reads: list[str] = []
     real = indexer.read_note_at
 
-    def counting(parent_fd, name):
+    def counting(parent_fd, name, rel=None):
         reads.append(name)
-        return real(parent_fd, name)
+        return real(parent_fd, name, rel)
 
     monkeypatch.setattr(indexer, "read_note_at", counting)
     return reads
@@ -463,8 +463,8 @@ async def test_a_slow_read_does_not_launder_a_same_tick_rewrite(monkeypatch, vau
     frozen = _stat(clock["now"] - 1 * SECOND, clock["now"] - 1 * SECOND)
     real_read = indexer.read_note_at
 
-    def slow_read_with_a_same_tick_rewrite(parent_fd, name):
-        raw, _real_stat = real_read(parent_fd, name)
+    def slow_read_with_a_same_tick_rewrite(parent_fd, name, rel=None):
+        raw, _real_stat = real_read(parent_fd, name, rel)
         if raw == "AAAA\n":
             note.write_text("BBBB\n", encoding="utf-8")  # same size, same tick
             clock["now"] += 3 * SECOND  # the read outlasts the window
@@ -518,10 +518,10 @@ def _failing_read(monkeypatch, bad_name: str):
     """`read_note_at` raising an I/O error for one file: bytes not obtained."""
     real = indexer.read_note_at
 
-    def failing(parent_fd, name):
+    def failing(parent_fd, name, rel=None):
         if name == bad_name:
             raise OSError(5, "Input/output error")
-        return real(parent_fd, name)
+        return real(parent_fd, name, rel)
 
     monkeypatch.setattr(indexer, "read_note_at", failing)
 

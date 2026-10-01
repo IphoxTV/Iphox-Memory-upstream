@@ -92,10 +92,10 @@ async def test_health_answers_and_the_loop_progresses_during_a_pass(
     reading = threading.Event()
     real = indexer.read_note_at
 
-    def blocking_read(parent_fd, name):
+    def blocking_read(parent_fd, name, rel=None):
         reading.set()
         time.sleep(2)
-        return real(parent_fd, name)
+        return real(parent_fd, name, rel)
 
     monkeypatch.setattr(indexer, "read_note_at", blocking_read)
 
@@ -141,11 +141,11 @@ async def test_cancellation_stops_the_scan_before_its_next_file(monkeypatch, vau
     first_read = threading.Event()
     real = indexer.read_note_at
 
-    def slow_read(parent_fd, name):
+    def slow_read(parent_fd, name, rel=None):
         started.append(name)
         first_read.set()
         time.sleep(0.5)
-        return real(parent_fd, name)
+        return real(parent_fd, name, rel)
 
     monkeypatch.setattr(indexer, "read_note_at", slow_read)
 

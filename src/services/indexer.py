@@ -76,9 +76,12 @@ from src.oauth.grants import lock_account_guard
 from src.services import vault_overlap
 from src.services.transfer import canonical_vault_root
 from src.services.vault import (
+    MAX_PATH_CHARS,
+    MAX_TAG_BYTES,
     _vault_root,
     canonical_key,
     extract_tags,
+    is_encodable,
     non_finite_token,
     note_title,
     parse_frontmatter,
@@ -631,24 +634,33 @@ def _jsonb_value(v):
     which to report the loss and must never fail the pass, so a deterministic,
     documented winner is the whole available remedy. The read view, which
     *can* report a loss, omits the view whole instead (design D10, L14).
+
+    **U+0000 is removed from every string key and value** (#308, D2): YAML's
+    `"\\0"` escape produces one from NUL-free bytes, and `jsonb` rejects it
+    (`\\u0000 cannot be converted to text`). Removed on this walk, at the
+    same boundary, and a key that collides after removal follows the same
+    first-key-wins rule. A non-string value that is stringified below (a date)
+    cannot contain NUL.
     """
     token = non_finite_token(v)
     if token is not None:
         return token
-    if isinstance(v, (str, int, float, bool, type(None))):
+    if isinstance(v, str):
+        return v.replace("\x00", "")
+    if isinstance(v, (int, float, bool, type(None))):
         return v
     elif isinstance(v, list):
         return [_jsonb_value(i) for i in v]
     elif isinstance(v, dict):
         out: dict = {}
         for k, val in v.items():
-            rendered = canonical_key(k)
+            rendered = canonical_key(k).replace("\x00", "")
             if rendered in out:
                 continue  # first key wins, stated rather than inherited
             out[rendered] = _jsonb_value(val)
         return out
     else:
-        return str(v)
+        return str(v).replace("\x00", "")
 
 
 def _sanitize_frontmatter(fm: dict) -> dict:
@@ -1393,7 +1405,64 @@ def _format_skips(skips: list[str]) -> str:
         if len(skips) > len(shown)
         else ""
     )
-    return ", ".join(shown) + suffix
+    return ", ".join(_loggable_path(s) for s in shown) + suffix
+
+
+def _loggable_path(rel: str) -> str:
+    """`rel` rendered so it can always be logged and stored (#308, D7).
+
+    A filename that is not valid UTF-8 reaches Python as a surrogate-escaped
+    `str` (`caf\\udce9.md`), which no UTF-8 sink can encode. `backslashreplace`
+    renders each such code point as its escape, so the log line names the file
+    without raising.
+    """
+    return rel.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Present but not indexable (#308, design D7)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Three inputs can never be held by the index, whatever the pass does: a
+# vault-relative path that is not encodable as UTF-8 (a Latin-1 byte in a
+# filename, surrogate-escaped by `os.scandir`), a path longer than
+# `notes_metadata.file_path` (`MAX_PATH_CHARS`), and a file whose bytes were
+# read in full but are not valid UTF-8. The first two used to fail at the
+# first bind — the move UPDATE or the batch upsert — and roll the owner's
+# whole pass back every tick, exactly like #308. The third left the row in
+# place (the path was `seen`, so neither upserted nor pruned), and search went
+# on serving content the file no longer holds.
+#
+# All three are decided at the scan, before any write, and the C4 locked
+# re-read applies the same test. Such a path is excluded from the upsert and
+# from move pairing, and any row at it is deleted in the pass's transaction
+# through the ordinary delete (embeddings and outgoing links cascade). It is
+# NOT a skip: it does not withhold a re-derive's stamp (its row is deleted, so
+# nothing foreign survives at it) and it does not keep the scope due for a
+# full-hash pass. A file that cannot be *read* (EACCES, EIO, ENOENT) is not in
+# this class: its row may be right for a file merely unreadable now, so it is
+# kept.
+
+#: The reason `_scan_vault` records for bytes that are not valid UTF-8.
+NOT_UTF8_CONTENT = "content is not valid UTF-8"
+
+
+def _path_not_indexable_reason(rel: str) -> str | None:
+    """Why `rel` itself can never be a `file_path`, or None if it can."""
+    if not is_encodable(rel):
+        return "path is not valid UTF-8"
+    if len(rel) > MAX_PATH_CHARS:
+        return f"path is {len(rel):,} characters, over {MAX_PATH_CHARS:,}"
+    return None
+
+
+def _warn_not_indexable(rel: str, reason: str) -> None:
+    logger.warning(
+        "Not indexing %s: %s. Any index row at this path is removed; the file "
+        "on disk is unchanged",
+        _loggable_path(rel),
+        reason,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1524,8 +1593,23 @@ def discover_markdown_files(vault: Path) -> dict[str, Path]:
         }
 
 
-def read_note_at(parent_fd: int, name: str) -> tuple[str, os.stat_result]:
+def read_note_at(
+    parent_fd: int, name: str, rel: str | None = None
+) -> tuple[str, os.stat_result]:
     """`(text, stat)` for one note, both from **one** open descriptor.
+
+    **The returned text has every U+0000 removed** (#308, design D1). This is
+    the indexer's single decode point — the scan, the C4 re-read, the embed
+    backlog, reconciliation, the link backfill and the tsvector rebuild all
+    read through it — so the content hash and every derived column (keyword
+    vector, title, tags, links, chunk text) describe the same NUL-free text,
+    and no re-verifier can disagree with the scan about a hash. PostgreSQL
+    `text` cannot hold 0x00: one NUL used to fail the keyword-vector UPDATE and
+    roll the owner's whole pass back, every tick. A note without a NUL is
+    returned unchanged, so its hash is unchanged. The file on disk is never
+    modified. One WARNING per read that removed anything names `rel` (the
+    vault-relative path; `name` when the caller has none) and the count —
+    never content.
 
     Deliberately **no** `O_NOFOLLOW` on the leaf: a symlinked `.md` is read
     today and this change must not alter what the index contains. Containment
@@ -1545,9 +1629,19 @@ def read_note_at(parent_fd: int, name: str) -> tuple[str, os.stat_result]:
     try:
         stat = os.fstat(fd)
         with open(fd, "r", encoding="utf-8", errors="strict", closefd=False) as handle:
-            return handle.read(), stat
+            text_ = handle.read()
     finally:
         os.close(fd)
+    nul = text_.count("\x00")
+    if nul:
+        logger.warning(
+            "Removed %d NUL character(s) from %s before indexing; the file on "
+            "disk is unchanged",
+            nul,
+            _loggable_path(rel if rel is not None else name),
+        )
+        text_ = text_.replace("\x00", "")
+    return text_, stat
 
 
 def open_beneath(root_fd: int, rel_path: str) -> tuple[int, str]:
@@ -1581,7 +1675,7 @@ def read_note_beneath(root_fd: int, rel_path: str) -> tuple[str, os.stat_result]
     """`read_note_at` for a path the caller names rather than one it walked."""
     parent_fd, name = open_beneath(root_fd, rel_path)
     try:
-        return read_note_at(parent_fd, name)
+        return read_note_at(parent_fd, name, rel=rel_path)
     finally:
         os.close(parent_fd)
 
@@ -1709,13 +1803,19 @@ class ScanResult:
     skips: list[str] = field(default_factory=list)
     #: The subset of `skips` whose bytes were **not obtained**: a directory the
     #: walk could not list, a file whose read raised. These block the
-    #: backstop's clock (D12). A file that was read in full but is not valid
-    #: UTF-8 is in `skips` and not here: its bytes were obtained, it is never
-    #: indexed from them, and re-reading it every tick could not change that
-    #: outcome (a row left from when it still decoded is kept, not pruned, as
-    #: before this change; its stat no longer matches, so every pass re-reads
-    #: it and logs the skip).
+    #: backstop's clock (D12).
     unverified: list[str] = field(default_factory=list)
+    #: Directories the walk could not open or list, as skip entries. Each
+    #: withholds a re-derive's stamp unconditionally: anything beneath it could
+    #: have a row (#308, D8).
+    walk_failures: list[str] = field(default_factory=list)
+    #: `(rel, skip entry)` for each file whose read raised. It withholds a
+    #: re-derive's stamp only if the **locked** rows have that path — decided
+    #: under the lock, not here (D8).
+    read_failures: list[tuple[str, str]] = field(default_factory=list)
+    #: Present on disk, not indexable: `rel -> reason` (D7). Not in `skips`, not
+    #: in `unverified`, not in `files`; any row at the path is deleted.
+    not_indexable: dict[str, str] = field(default_factory=dict)
     reads: int = 0
     shortcut: int = 0
 
@@ -1735,7 +1835,7 @@ def _read_and_hash(
     thread and, for re-processed paths, through `to_thread` under the lock.
     """
     t_start = _wall_clock_ns()
-    raw, st = read_note_at(parent_fd, name)
+    raw, st = read_note_at(parent_fd, name, rel=rel)
     return raw, _content_hash(raw), st, _recordable_stat(st, t_start)
 
 
@@ -1786,6 +1886,14 @@ def _scan_vault(
                 raise ScanCancelled("the index pass was cancelled mid-walk")
             rel = found.rel
             result.seen.add(rel)
+            # D7: a path the index can never hold is decided before the stat
+            # or the read — no row can exist at it, and it must never reach a
+            # bind parameter.
+            reason = _path_not_indexable_reason(rel)
+            if reason is not None:
+                _warn_not_indexable(rel, reason)
+                result.not_indexable[rel] = reason
+                continue
             row = snapshot.get(rel)
             if (
                 not force_read
@@ -1810,16 +1918,20 @@ def _scan_vault(
             try:
                 raw, h, st, recorded = _read_and_hash(found.parent_fd, found.name, rel)
             except UnicodeDecodeError:
-                # Bytes read in full; decoded-content-only. A skip (A.7a), not
-                # unverified (D12).
-                logger.warning(f"Skipping non-UTF8 file: {rel}")
-                result.skips.append(f"{rel} (not valid UTF-8)")
+                # Bytes read in full and provably not the bytes any row was
+                # derived from: present but not indexable (D7). Not a skip,
+                # not unverified; its row, if any, is deleted under the lock.
+                _warn_not_indexable(rel, NOT_UTF8_CONTENT)
+                result.not_indexable[rel] = NOT_UTF8_CONTENT
                 continue
             except Exception as e:
-                # Bytes not obtained: unverified, blocks the backstop's clock.
+                # Bytes not obtained: unverified, blocks the backstop's clock,
+                # and keeps any row at the path (D7 does not apply).
                 logger.warning(f"Failed to read {rel}: {e}")
-                result.skips.append(f"{rel} ({e})")
-                result.unverified.append(f"{rel} ({e})")
+                entry = f"{rel} ({e})"
+                result.skips.append(entry)
+                result.unverified.append(entry)
+                result.read_failures.append((rel, entry))
                 continue
             result.reads += 1
             result.files[rel] = ScannedFile(
@@ -1834,6 +1946,7 @@ def _scan_vault(
             )
     result.skips.extend(walk_failures)
     result.unverified.extend(walk_failures)
+    result.walk_failures.extend(walk_failures)
     return result
 
 
@@ -1899,9 +2012,9 @@ async def _run_scan(
 # first embed pass after a start a sweeping one.
 
 #: Monotonic time of each scope's last **successful** full-hash pass: one that
-#: committed having read and hashed every discovered file (non-UTF-8 files do
-#: not block; see `_index_vault_pinned`). Absent means due; a forced pass
-#: removes the entry before it starts.
+#: committed having read and hashed every discovered file (present-but-not-
+#: indexable paths do not block; see `_index_vault_pinned`). Absent means due;
+#: a forced pass removes the entry before it starts.
 _last_full_hash: dict[int | None, float] = {}
 
 #: Each scope's exclusion-pattern fingerprint as of its last **clean** sweep.
@@ -2047,6 +2160,63 @@ async def _reconcile_provenance(
     return True, facts
 
 
+#: What a committed re-derive established about its provenance stamp (#308,
+#: D8). `IndexPassResult.rederive` is None when the pass was not a re-derive.
+REDERIVE_RECORDED = "recorded"
+#: Withheld by a skip that could hide a row (D8); the next pass re-derives
+#: again, rewriting the whole scope. The signal failure accounting counts.
+REDERIVE_INCOMPLETE = "incomplete"
+#: Nothing withheld it, but the stamp itself was refused (lock unavailable, or
+#: the assignment moved); the next pass re-derives again.
+REDERIVE_UNRECORDED = "unrecorded"
+
+
+class IndexPassResult(tuple):
+    """`index_vault`'s `(notes_scanned, notes_indexed)`, plus what the pass
+    knows that a count cannot say.
+
+    Still a two-tuple, so every caller that unpacks it — `PassStats.
+    record_index`, the panel — is unchanged. The extra facts are attributes:
+
+    - `rederive`: None (not a re-derive), `REDERIVE_RECORDED`,
+      `REDERIVE_INCOMPLETE` or `REDERIVE_UNRECORDED`. Only a pass that
+      *committed* returns at all, so this is a committed re-derive's outcome.
+    - `rederive_incomplete`: True exactly when a skip that could hide a row
+      withheld the stamp (D8) — the per-scope condition failure accounting
+      counts toward degradation.
+    - `not_indexable`: how many discovered paths were present but not
+      indexable (D7).
+    """
+
+    rederive: str | None
+    not_indexable: int
+
+    def __new__(
+        cls,
+        notes_scanned: int,
+        notes_indexed: int,
+        *,
+        rederive: str | None = None,
+        not_indexable: int = 0,
+    ):
+        obj = super().__new__(cls, (notes_scanned, notes_indexed))
+        obj.rederive = rederive
+        obj.not_indexable = not_indexable
+        return obj
+
+    @property
+    def notes_scanned(self) -> int:
+        return self[0]
+
+    @property
+    def notes_indexed(self) -> int:
+        return self[1]
+
+    @property
+    def rederive_incomplete(self) -> bool:
+        return self.rederive == REDERIVE_INCOMPLETE
+
+
 async def index_vault(user_id: int | None = None, *, full_hash: bool = False):
     """Scan vault, upsert notes_metadata with tsvector, remove deleted files.
 
@@ -2072,10 +2242,11 @@ async def index_vault(user_id: int | None = None, *, full_hash: bool = False):
     it. A backstop pass also forgets the scope's clean-sweep record, so the
     embed pass that follows runs the exclusion sweep (D13).
 
-    Returns `(notes_scanned, notes_indexed)` for the pass recorder (#160):
-    every markdown file the walk discovered, and the subset whose row this pass
-    wrote — the upserts plus the moves it repaired in place. Callers that do
-    not record a run may ignore it.
+    Returns an `IndexPassResult` — the two-tuple `(notes_scanned,
+    notes_indexed)` for the pass recorder (#160): every markdown file the walk
+    discovered, and the subset whose row this pass wrote, the upserts plus the
+    moves it repaired in place — carrying `rederive` / `rederive_incomplete`
+    (#308, D8) as attributes. Callers that do not record a run may ignore it.
 
     Refuses outright for a user the published overlap snapshot names — see
     `_refuse_quarantined_pass`. Nothing is read, written, pruned or
@@ -2147,7 +2318,7 @@ async def _index_vault_pinned(
     log_suffix: str,
     *,
     backstop: bool = True,
-) -> tuple[int, int]:
+) -> "IndexPassResult":
     # C6: provenance is reconciled first, in its own committed session, and
     # decides `re_derive` before a single file is read.
     re_derive = False
@@ -2161,21 +2332,31 @@ async def _index_vault_pinned(
         # moved; nothing a previous sweep established about them stands.
         clear_sweep_state(user_id)
 
-    # Anything the pass discovered but could not fully process. **A non-empty
-    # list makes a re-derive incomplete and withholds the stamp** (A.7a): the
-    # re-derive's whole claim is that every surviving row was written by this
-    # pass from a file under the assigned root, and one skipped path falsifies
-    # it — the ordinary prune keeps a row whose relative path exists under the
-    # new root, which is exactly the row a re-derive exists to replace. The
-    # repairs are still performed; only the certification is withheld.
+    # Anything the pass discovered but could not fully process, for the log.
     #
-    # **It also withholds the backstop's clock** (D12), with one exception: a
-    # file whose bytes were read in full but are not valid UTF-8. The clock
-    # asks "was every discovered file's bytes read and hashed", and such a
-    # file's were; it is never indexed, so no row can go stale from it, and a
-    # full-hash pass every tick could not change that. Every other skip
-    # blocks the clock; each source is classified where it is appended, and
-    # the rule is applied after the commit (`unverified`, `blocking_skips`).
+    # **Only the subset in `withholding` makes a re-derive incomplete** (A.7a,
+    # narrowed by #308 D8): the re-derive's whole claim is that every
+    # surviving row was written by this pass from a file under the assigned
+    # root, and a skip falsifies it only if it can hide a row — the ordinary
+    # prune keeps a row whose relative path exists under the new root, which
+    # is exactly the row a re-derive exists to replace. So a skip withholds
+    # the stamp when the skipped path has a row in the **locked** rows, when
+    # a directory could not be listed (anything beneath it may have one), or
+    # when the path was already selected for upsert (the keyword-vector and
+    # link-rebuild skips, whose derived rows this pass did not write); a C5
+    # deferral always has a row. A read skip on a path with no row cannot
+    # certify a foreign row and does not withhold: before D8 it did, and since
+    # a re-derive rewrites every file each tick until it records, one
+    # row-less unreadable file meant a full-scope rewrite every tick for ever.
+    # A present-but-not-indexable path (D7) is not a skip at all — any row at
+    # it is deleted in this transaction. The repairs are always performed;
+    # only the certification is withheld.
+    #
+    # **Skips also withhold the backstop's clock** (D12): every skip here
+    # blocks it (walk and read failures via `unverified`, and everything
+    # appended after `downstream_skips_from`). A not-indexable path does not:
+    # its bytes were read (or it can never be read into the index), and a
+    # full-hash pass every tick could not change that outcome.
     #
     # **Carve-out: a note whose link extraction was truncated at
     # `MAX_LINKS_PER_NOTE` is NOT a skip** (#203, D4). The claim A.7a makes is
@@ -2189,6 +2370,7 @@ async def _index_vault_pinned(
     # the row, one ERROR line per capped note per pass, and `truncated: true`
     # from `get_links` — so it is visible without being fatal.
     skips: list[str] = []
+    withholding: list[str] = []
 
     # ── The snapshot S, in its own committed transaction (C2) ─────────────
     # A plain SELECT holds `AccessShareLock` until its transaction ends, so a
@@ -2213,8 +2395,10 @@ async def _index_vault_pinned(
     )
     skips.extend(scan.skips)
     # Backstop-blocking failures (D12). From the scan: walk failures and read
-    # errors (`ScanResult.unverified`); its non-UTF-8 skips are not in it.
+    # errors (`ScanResult.unverified`).
     unverified: list[str] = list(scan.unverified)
+    # D8: a directory the walk could not list withholds unconditionally.
+    withholding.extend(scan.walk_failures)
     seen = scan.seen
     logger.info(
         f"Found {len(seen)} markdown files{log_suffix}: {scan.reads} read, "
@@ -2289,25 +2473,45 @@ async def _index_vault_pinned(
         # walk's verdict about it (including a shortcut skip) is never applied
         # to a row it was not made against. A path the walk already failed to
         # read stays the skip it is.
+        # D8: a scan read failure withholds a re-derive's stamp only if the
+        # locked rows have that path — a row-less unreadable file cannot hide
+        # a foreign row.
+        for rel, entry in scan.read_failures:
+            if rel in locked:
+                withholding.append(entry)
+
         reprocessed = 0
         for rel in sorted(seen):
-            if snapshot.get(rel) == locked.get(rel) or rel not in scan.files:
+            if snapshot.get(rel) == locked.get(rel):
+                continue
+            # A path decided not indexable by its *content* is re-read like a
+            # decoded one: its row moved under the walk, so the walk's verdict
+            # is not the one to apply (D7). A path not indexable by its *name*
+            # can have no row, so it never reaches here.
+            undecodable = scan.not_indexable.get(rel) == NOT_UTF8_CONTENT
+            if rel not in scan.files and not undecodable:
                 continue
             try:
                 scan.files[rel] = await asyncio.to_thread(_rescan_one, root_fd, rel)
+                scan.not_indexable.pop(rel, None)
                 reprocessed += 1
             except UnicodeDecodeError:
-                # C4 re-read, bytes read in full: decoded-content-only, so a
-                # skip that does not block the clock.
-                logger.warning(f"Skipping non-UTF8 file: {rel}")
-                skips.append(f"{rel} (not valid UTF-8)")
-                del scan.files[rel]
+                # C4 re-read, bytes read in full and not valid UTF-8: present
+                # but not indexable (D7) — its locked row is deleted below.
+                _warn_not_indexable(rel, NOT_UTF8_CONTENT)
+                scan.not_indexable[rel] = NOT_UTF8_CONTENT
+                scan.files.pop(rel, None)
             except Exception as e:
-                # C4 re-read failure, bytes not obtained: blocks the clock.
+                # C4 re-read failure, bytes not obtained: blocks the clock, and
+                # keeps the row — which is why it withholds if there is one.
                 logger.warning(f"Failed to read {rel}: {e}")
-                skips.append(f"{rel} ({e})")
-                unverified.append(f"{rel} ({e})")
-                del scan.files[rel]
+                entry = f"{rel} ({e})"
+                skips.append(entry)
+                unverified.append(entry)
+                if rel in locked:
+                    withholding.append(entry)
+                scan.files.pop(rel, None)
+                scan.not_indexable.pop(rel, None)
         if reprocessed:
             logger.info(
                 "Re-read %d path(s) whose row changed between the snapshot "
@@ -2316,11 +2520,11 @@ async def _index_vault_pinned(
                 log_suffix,
             )
 
-        # Every skip appended from here on blocks the backstop's clock, none
-        # of them being a decoded-content-only failure: a missing buffered
-        # body (read failure, including a non-UTF-8 re-read, left a row this
-        # pass did not rewrite), a parse failure (bytes hashed but the row not
-        # rewritten, so it can be stale), a C5 deferral under re-derive (a row
+        # Every skip appended from here on blocks the backstop's clock: a
+        # missing buffered body (a read failure left a row this pass did not
+        # rewrite; a non-UTF-8 re-read is D7's not-indexable instead), a
+        # parse failure (bytes hashed but the row not rewritten, so it can be
+        # stale), a C5 deferral under re-derive (a row
         # the walk could not speak for), the keyword vector's missing body and
         # the link rebuild's skips (derived rows this pass did not write).
         downstream_skips_from = len(skips)
@@ -2387,9 +2591,16 @@ async def _index_vault_pinned(
                 # it was re-read with its body. Read it rather than trust that.
                 try:
                     found = await asyncio.to_thread(_rescan_one, root_fd, rel_path)
+                except UnicodeDecodeError:
+                    _warn_not_indexable(rel_path, NOT_UTF8_CONTENT)
+                    scan.not_indexable[rel_path] = NOT_UTF8_CONTENT
+                    continue
                 except Exception as e:
                     logger.warning(f"Failed to read {rel_path}: {e}")
-                    skips.append(f"{rel_path} ({e})")
+                    entry = f"{rel_path} ({e})"
+                    skips.append(entry)
+                    if rel_path in locked:
+                        withholding.append(entry)
                     continue
                 h = found.content_hash
             raw = found.raw
@@ -2406,10 +2617,27 @@ async def _index_vault_pinned(
                 # inside one, so this bounds the stall to the longest
                 # single scan step rather than to zero; that step is short
                 # because the grammars are linear.
-                tags = await asyncio.to_thread(extract_tags, content, frontmatter)
+                dropped_tags: list[int] = []
+                tags = await asyncio.to_thread(
+                    extract_tags, content, frontmatter, dropped=dropped_tags
+                )
+                if dropped_tags:
+                    # Sizes only, never the tag: it is note content (#308, D2).
+                    logger.warning(
+                        "Dropped %d tag(s) of %s byte(s) from %s: tags over "
+                        "%d bytes are not indexed",
+                        len(dropped_tags),
+                        ", ".join(str(n) for n in dropped_tags),
+                        _loggable_path(rel_path),
+                        MAX_TAG_BYTES,
+                    )
             except Exception as e:
                 logger.warning(f"Failed to parse {rel_path}: {e}")
-                skips.append(f"{rel_path} (parse: {e})")
+                entry = f"{rel_path} (parse: {e})"
+                skips.append(entry)
+                # Not upserted, so a row at the path survives unrewritten.
+                if rel_path in locked:
+                    withholding.append(entry)
                 continue
             path_to_content[rel_path] = content
             title = _note_title(frontmatter, found.name)
@@ -2475,7 +2703,10 @@ async def _index_vault_pinned(
                 log_suffix,
             )
             if re_derive:
-                skips.append(f"{p} (row changed mid-walk; deferred)")
+                # A deferred path has a locked row by construction.
+                entry = f"{p} (row changed mid-walk; deferred)"
+                skips.append(entry)
+                withholding.append(entry)
 
         # ── Move detection ────────────────────────────────────────────────
         # An external move (file dragged in Obsidian) looks like
@@ -2612,6 +2843,24 @@ async def _index_vault_pinned(
             to_upsert = [e for e in to_upsert if e["file_path"] not in moved_new_paths]
             deleted_paths -= {old for old, _ in moves}
 
+        # D7: a row at a present-but-not-indexable path is deleted through the
+        # ordinary prune below — embeddings and outgoing links cascade, inbound
+        # links fall back to dangling — so search never serves content the
+        # file no longer holds. Added after move detection on purpose: such a
+        # path is neither a move source nor (never being in `to_upsert`) a
+        # destination. No C5 test: every such path was seen by this walk, and
+        # one whose row moved under the walk was re-read under the lock above.
+        not_indexable_rows = {p for p in scan.not_indexable if p in existing}
+        if not_indexable_rows:
+            deleted_paths |= not_indexable_rows
+            logger.warning(
+                "Removing the index row(s) of %d present-but-not-indexable "
+                "path(s)%s: %s",
+                len(not_indexable_rows),
+                log_suffix,
+                _format_skips(sorted(not_indexable_rows)),
+            )
+
         # Upsert changed files
         if to_upsert:
             for batch_start in range(0, len(to_upsert), 100):
@@ -2730,7 +2979,9 @@ async def _index_vault_pinned(
                 # `continue`: it leaves a row whose keyword vector this pass did
                 # not write, which a re-derive must not certify.
                 if path not in path_to_content:
-                    skips.append(f"{path} (no buffered body for the keyword vector)")
+                    entry = f"{path} (no buffered body for the keyword vector)"
+                    skips.append(entry)
+                    withholding.append(entry)  # in `to_upsert`: always (D8)
                     continue
                 content = path_to_content[path]
                 params: dict = {"path": path, **tsv_params}
@@ -2767,21 +3018,26 @@ async def _index_vault_pinned(
         # Moved notes need outgoing-link re-extraction too: same-folder
         # resolution can change once the note sits in a different directory.
         if to_upsert or deleted_paths or moved_new_paths:
+            # Every link-rebuild skip is on a changed path — one this pass
+            # selected for upsert or moved — so every one withholds (D8).
+            link_skips: list[str] = []
             await _update_links_for_changed(
                 session,
                 vault,
                 [n["file_path"] for n in to_upsert] + list(moved_new_paths),
                 user_id=user_id,
                 path_to_content=path_to_content,
-                skips=skips,
+                skips=link_skips,
             )
+            skips.extend(link_skips)
+            withholding.extend(link_skips)
 
         # ── The tail stamp ────────────────────────────────────────────────
         # Written where the state it describes is established. On the re-derive
         # branch that state is "every surviving row was derived from this
         # root", which is not true until the pass has finished — so the stamp
-        # is issued after the pass's last write and **only if it skipped
-        # nothing**. Head-stamping a re-derive would be exactly the false
+        # is issued after the pass's last write and **only if no skip could
+        # hide a row** (`withholding`, D8). Head-stamping a re-derive would be exactly the false
         # provenance this record exists to prevent, written by our own code
         # instead of by a migration.
         #
@@ -2789,17 +3045,35 @@ async def _index_vault_pinned(
         # a crash mid-repair leave the previous record untouched, so the next
         # pass repairs again: bounded, idempotent, and never a stamp over a
         # half-repaired index.
+        rederive: str | None = None
         if re_derive and facts is not None:
-            if skips:
+            if withholding:
+                rederive = REDERIVE_INCOMPLETE
                 logger.warning(
                     "Re-derive incomplete%s: %d discovered path(s) were not "
-                    "fully processed, so no provenance was recorded and the "
-                    "next pass will re-derive again. Offenders: %s",
+                    "fully processed and could hide a row, so no provenance "
+                    "was recorded and the next pass will re-derive again. "
+                    "Offenders: %s",
                     log_suffix,
-                    len(skips),
-                    _format_skips(skips),
+                    len(withholding),
+                    _format_skips(withholding),
                 )
+                if len(skips) > len(withholding):
+                    logger.warning(
+                        "%d other path(s) were not fully processed%s: %s",
+                        len(skips) - len(withholding),
+                        log_suffix,
+                        _format_skips([x for x in skips if x not in withholding]),
+                    )
             else:
+                if skips:
+                    logger.warning(
+                        "%d discovered path(s) were not fully processed%s, "
+                        "none with a row they could hide: %s",
+                        len(skips),
+                        log_suffix,
+                        _format_skips(skips),
+                    )
                 # The same binding as the discard's, for the same reason: this
                 # stamp is provenance too, and a record written under an
                 # assignment the row no longer names is exactly the false
@@ -2825,6 +3099,7 @@ async def _index_vault_pinned(
                         )
                         stamped = await _stamp_provenance(session, user_id, facts)
                 except ProvenanceLockUnavailable as exc:
+                    rederive = REDERIVE_UNRECORDED
                     logger.warning(
                         "Re-derive complete but not recorded%s: %s. The "
                         "repairs are committed; the next pass will re-derive "
@@ -2833,6 +3108,7 @@ async def _index_vault_pinned(
                         exc,
                     )
                 except ProvenanceRaceAborted as exc:
+                    rederive = REDERIVE_UNRECORDED
                     logger.warning(
                         "Re-derive complete but not recorded%s: %s. The next "
                         "pass will reclassify and re-derive again.",
@@ -2845,6 +3121,7 @@ async def _index_vault_pinned(
                             f"Re-derive stamp{log_suffix} matched {stamped} "
                             f"row(s) for user_id={user_id}, not exactly one."
                         )
+                    rederive = REDERIVE_RECORDED
                     logger.info(
                         "Re-derive complete%s: recorded provenance "
                         "assignment=%r realpath=%r handle=%s",
@@ -2871,7 +3148,8 @@ async def _index_vault_pinned(
     # **and read and hashed every discovered file's bytes** (D12). One that
     # aborted, was refused or cancelled never reaches this line; one that
     # committed with a blocking skip leaves the scope due, so its next pass is
-    # again a full-hash pass. A non-UTF-8 file does not block (see `skips`).
+    # again a full-hash pass. A present-but-not-indexable path (D7) is not a
+    # skip and does not block.
     blocking_skips = unverified + skips[downstream_skips_from:]
     if backstop and not blocking_skips:
         _last_full_hash[user_id] = time.monotonic()
@@ -2890,7 +3168,12 @@ async def _index_vault_pinned(
     # moved paths count as indexed — the id-preserving branch rewrote those
     # rows — and they were removed from `to_upsert` above, so the two sets are
     # disjoint and nothing is double-counted.
-    return len(seen), len(to_upsert) + len(moved_new_paths)
+    return IndexPassResult(
+        len(seen),
+        len(to_upsert) + len(moved_new_paths),
+        rederive=rederive,
+        not_indexable=len(scan.not_indexable),
+    )
 
 
 async def _update_links_for_changed(

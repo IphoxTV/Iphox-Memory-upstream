@@ -2019,10 +2019,18 @@ def note_title(frontmatter: dict | None, filename: str) -> str:
 
     Safe by the scrub's invariant: `_partition_frontmatter` has already removed
     anything `str()` would refuse, so nothing here can raise.
+
+    **U+0000 is removed from the result** (#308, D2): YAML's `"\\0"` escape
+    produces a NUL from NUL-free bytes, and PostgreSQL `text` cannot store one.
+    Removed here, in the one shared rule, so the indexer, `read_note`'s
+    metadata and `move_note` show the same title. A title that is nothing but
+    NULs falls back to the stem, as any other empty title does. The parsed
+    frontmatter mapping itself is not touched.
     """
     value = _title_value((frontmatter or {}).get("title"))
-    stem = os.path.splitext(filename)[0]
-    return str(value or stem)[:TITLE_MAX_CHARS]
+    stem = os.path.splitext(filename)[0].replace("\x00", "")
+    rendered = str(value).replace("\x00", "") if value else ""
+    return (rendered or stem)[:TITLE_MAX_CHARS]
 
 
 def _decode_note_bytes(data: bytes) -> str:
@@ -3964,7 +3972,9 @@ def replace_section(text: str, heading: str, new_body: str) -> tuple[str | None,
     return new_text, None
 
 
-def extract_tags(body: str, frontmatter: dict) -> list[str]:
+def extract_tags(
+    body: str, frontmatter: dict, *, dropped: list[int] | None = None
+) -> list[str]:
     """Extract tags from a parsed frontmatter mapping and the body's inline #tags.
 
     **`body` is the post-frontmatter body, not the raw note.** Every caller has
@@ -3988,6 +3998,17 @@ def extract_tags(body: str, frontmatter: dict) -> list[str]:
     Precondition: `frontmatter` comes from the shared parser, so its values are
     already representable. Do not call this with a mapping straight out of
     `yaml.safe_load`.
+
+    **Two normalizations for the database's sake** (#308, D2), shared by every
+    surface: U+0000 is removed from each tag (a YAML `"\\0"` escape makes one
+    from NUL-free bytes), and a tag whose UTF-8 encoding exceeds
+    `MAX_TAG_BYTES` is dropped — `notes_metadata.tags` has a GIN index, and
+    one key over ~2.7 KB fails the row with 54000, taking the note's whole
+    index entry with it for the sake of one tag. The byte size of each dropped
+    tag is appended to `dropped` when the caller passes a list: the indexer
+    does, and logs one WARNING naming the note. The read path does not, so
+    `read_note` cannot be driven to write a log line per call (#190's rule
+    for request-path modules).
     """
     tags = set()
     # `frontmatter` MUST be a mapping from the shared parser, which has already
@@ -4008,4 +4029,24 @@ def extract_tags(body: str, frontmatter: dict) -> list[str]:
     masked = mask_code(body, context=BODY)
     for match in re.finditer(r"(?:^|\s)#([a-zA-Z][a-zA-Z0-9_/-]*)", masked):
         tags.add(match.group(1))
-    return sorted(tags)
+    return sorted(_bounded_tags(tags, dropped))
+
+
+#: The longest tag, in UTF-8 bytes, the shared tag derivation keeps (#308, D2).
+#: Well under the ~2.7 KB a GIN index key may occupy, and far beyond any tag a
+#: person writes.
+MAX_TAG_BYTES = 1024
+
+
+def _bounded_tags(tags, dropped: list[int] | None = None) -> set[str]:
+    """`tags` with NUL removed and over-long tags dropped (see `extract_tags`)."""
+    out: set[str] = set()
+    for tag in tags:
+        tag = tag.replace("\x00", "")
+        size = len(tag.encode("utf-8", "surrogatepass"))
+        if size > MAX_TAG_BYTES:
+            if dropped is not None:
+                dropped.append(size)
+            continue
+        out.add(tag)
+    return out
