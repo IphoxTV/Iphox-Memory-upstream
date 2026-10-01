@@ -2817,6 +2817,54 @@ async def trigger_reembed(
     return RedirectResponse("/admin/settings", status_code=303)
 
 
+@router.get("/settings/confirm-empty-vault", response_class=HTMLResponse)
+async def confirm_empty_vault_page(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_admin_panel),
+):
+    """Single-user "Confirm vault is empty" (#309, D5): the confirmation page.
+
+    The token rules and why the re-embed pattern was not reused are in
+    `empty_vault_confirm`. Multi-user mode confirms per user, on
+    `/admin/users/{id}/confirm-empty-vault`; here it renders the refusal.
+    """
+    from src.control_panel import empty_vault_confirm
+
+    return await empty_vault_confirm.render_confirm_page(
+        request,
+        session,
+        user,
+        None,
+        templates,
+        post_action="/admin/settings/confirm-empty-vault",
+        cancel_url="/admin/settings",
+    )
+
+
+@router.post("/settings/confirm-empty-vault")
+async def confirm_empty_vault(
+    request: Request,
+    token: str = Form(""),
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_admin_panel),
+):
+    """Redeem the token: grant the single-user scope its empty-prune
+    permission and start a pass for it alone. Existing `_reindex_background`
+    callers are untouched; this one goes through `index_scope_now`."""
+    from src.control_panel import empty_vault_confirm
+
+    return await empty_vault_confirm.handle_confirm_post(
+        request,
+        session,
+        user,
+        None,
+        token,
+        back_url="/admin/settings",
+        done_url="/admin/settings",
+    )
+
+
 @router.post("/settings/reset-embeddings")
 async def reset_embeddings(
     request: Request,

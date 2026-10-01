@@ -374,7 +374,21 @@ CASES = [
         200,
         False,
     ),
+    (
+        "confirm-empty-vault",
+        ("GET", "/admin/settings/confirm-empty-vault"),
+        _get("/admin/settings/confirm-empty-vault", multi_user=False),
+        200,
+        False,
+    ),
     ("users", ("GET", "/admin/users/"), _get("/admin/users/"), 200, False),
+    (
+        "user-confirm-empty-vault",
+        ("GET", "/admin/users/{user_id}/confirm-empty-vault"),
+        _get("/admin/users/1/confirm-empty-vault"),
+        200,
+        False,
+    ),
     (
         "user-edit",
         ("GET", "/admin/users/{user_id}/edit"),

@@ -180,6 +180,22 @@
                     </button>
                 </form>
             </div>
+            <div class="kv">
+                <div>
+                    <div class="kv-k">Confirm vault is empty</div>
+                    <div class="u-color-text-3 u-font-size-12px u-margin-top-4px">
+                        The indexer will not delete this user's index when
+                        their vault root contains no markdown files — usually
+                        a mount that did not mount. If the vault really was
+                        emptied, confirm it: the next pass for this user only
+                        may then delete every indexed note. The next page
+                        shows how many and asks again (#309).
+                    </div>
+                </div>
+                <a href="/admin/users/{{ target.id }}/confirm-empty-vault" class="btn btn-danger">
+                    Confirm vault is empty
+                </a>
+            </div>
         </div>
     </div>
 

@@ -97,8 +97,9 @@
   any `javascript:` URL, any `hx-` attribute, or any `<script>`/`<style>`
   without `nonce="{{ csp_nonce }}"`.
 
-- **Destructive confirmations fail closed.** The eight `data-confirm`
-  controls (keys ×3, OAuth ×2, settings ×1, user edit ×2) are
+- **Destructive confirmations fail closed.** The nine `data-confirm`
+  controls (keys ×3, OAuth ×2, settings ×1, user edit ×2, and since #309
+  the final control of `empty_vault_confirm.html`) are
   `type="button"`, not submit buttons; the listener calls `confirm()` and, on
   yes, `form.requestSubmit()`, so the form's own validation and `submit`
   event still run. Without script — blocked, failed to load, disabled — the
@@ -724,6 +725,62 @@ cards between the latency table and the search phases.
   an unconditional `CREATE INDEX` aborts the entire reset on such a deployment
   and leaves the operator with a wiped column and no index (#6).
   `trigger_reembed` creates no index at all, so the condition is vacuous there.
+
+## "Confirm vault is empty" (#309)
+
+The indexer refuses to prune a scope whose vault root yields no markdown file
+while its index holds rows (`IndexIndeterminate`; see
+[indexing and embeddings](indexing-and-embeddings.md)): an empty root is far
+more often a mount that did not mount than a vault emptied on purpose. This
+action is how an administrator says it was on purpose.
+
+- **Where.** Single-user: a link in the settings Danger zone to
+  `GET /admin/settings/confirm-empty-vault` (rendered only when
+  `multi_user_mode` is off; in multi-user mode that route renders a refusal).
+  Multi-user: a link on each user's edit page to
+  `GET /admin/users/{id}/confirm-empty-vault`. Both are admin-only
+  (`require_admin_panel`, router-level for `/admin/users`), and their POSTs
+  pass the router's `verify_csrf` like every other panel POST. The shared
+  bodies live in `src/control_panel/empty_vault_confirm.py`; one template,
+  `empty_vault_confirm.html`, serves both.
+- **The page states the count.** It shows how many indexed notes
+  (`notes_metadata` rows of that scope) a confirmed pass would delete, and
+  issues a token only when there is something to confirm: zero rows says
+  "nothing to confirm", an ineligible target says why, and neither carries a
+  form. The final control is a `type="button"` with `data-confirm` in a form
+  of hidden fields only, so it fails closed (the ninth such control).
+- **Why the re-embed confirmation was not reused.** `reembed-confirm` signs a
+  random string and checks its age, nothing else: replayable within its
+  minute, by any administrator, naming no target. Tolerable for a re-embed;
+  not for authorising the deletion of a tenant's index. This token has its own
+  salt (`confirm-empty-vault-v1`) and binds the action name, the target scope
+  (`None` or the user id), the issuing administrator's id, the scope's
+  canonical vault assignment (`transfer.canonical_vault_root`, the value the
+  indexer re-checks the permission against), a random **process epoch**
+  generated at import, and a random nonce.
+- **Redemption refuses — granting nothing and starting nothing — unless**
+  the signature is valid for that salt; the token is at most 10 minutes old
+  (separate from the permission's 15-minute TTL); its epoch is this process's
+  (a restart empties the consumed-nonce set, so a pre-restart token must not
+  verify); the redeeming administrator is the issuer; the posted scope is the
+  bound one; the scope's assignment *now* equals the bound one; and the nonce
+  has not been consumed. Consumption is an insert into an in-process set,
+  synchronous with the checks (no `await` between "unused" and "used"), with
+  entries kept until their token could no longer verify anyway. `--workers 1`
+  makes that set the server's.
+- **Eligibility, decided first and from the database as it stands.** A
+  multi-user target that is deleted, inactive, has no vault assigned, or is
+  named by the published vault-overlap snapshot (or no snapshot has been
+  published yet) is refused. Single-user always has its one scope.
+- **On success** `empty_prune.grant(scope, assignment, granted_by=<admin>)`
+  — which logs the WARNING with the administrator and the scope — then
+  `_spawn` starts `indexer.index_scope_now(scope)`: one full-hash pass and
+  its embed stage for **that scope only**. `_reindex_background` (Reindex
+  Now, re-embed, reset) is untouched and still fans out to every active user.
+  A refusal logs a WARNING with the reason and flashes it; the outcome lands
+  as a session flash on the settings or user page (settings gained the flash
+  block for this).
+- Tests: `tests/test_issue_309_panel_confirm_empty.py`.
 
 ## Two coverage questions, and the dashboard answers both
 

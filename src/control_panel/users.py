@@ -948,6 +948,50 @@ async def reset_password(
     return _back_to_list(request, f"Password reset for '{target.username}'.")
 
 
+@router.get("/{user_id}/confirm-empty-vault", response_class=HTMLResponse)
+async def confirm_empty_vault_page(
+    user_id: int,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    user: User | _SingleUserSentinel = Depends(require_admin_panel),
+):
+    """Multi-user "Confirm vault is empty" for one user (#309, D5).
+
+    The page states how many of the user's indexed notes a confirmed pass
+    would delete, or why this user cannot be confirmed (inactive, unassigned,
+    quarantined). Token rules: `src/control_panel/empty_vault_confirm.py`.
+    """
+    from src.control_panel import empty_vault_confirm
+
+    return await empty_vault_confirm.render_confirm_page(
+        request,
+        session,
+        user,
+        user_id,
+        templates,
+        post_action=f"/admin/users/{user_id}/confirm-empty-vault",
+        cancel_url=f"/admin/users/{user_id}/edit",
+    )
+
+
+@router.post("/{user_id}/confirm-empty-vault")
+async def confirm_empty_vault(
+    user_id: int,
+    request: Request,
+    token: str = Form(""),
+    session: AsyncSession = Depends(get_session),
+    user: User | _SingleUserSentinel = Depends(require_admin_panel),
+):
+    """Redeem the token: grant this user's scope the empty-prune permission
+    and start a pass for that scope alone — no other tenant is touched."""
+    from src.control_panel import empty_vault_confirm
+
+    back = f"/admin/users/{user_id}/edit"
+    return await empty_vault_confirm.handle_confirm_post(
+        request, session, user, user_id, token, back_url=back, done_url=back
+    )
+
+
 # --- Internal helpers -----------------------------------------------------
 
 

@@ -18,17 +18,17 @@
 
 ## 4. Panel (D5)
 
-- [ ] 4.1 Admin-only confirmation page (own salt; token binds action, scope, admin id, assignment, process epoch, nonce; 10-min expiry; atomic nonce consumption) stating the row count + POST action that checks eligibility, grants the permission, and starts a new **scope-targeted** background pass; existing `_reindex_background` callers unchanged; WARNING with admin username and scope
-- [ ] 4.2 Single-user: settings Danger zone control; multi-user: user edit page control; CSP rules (`data-*`, nonce, `type="button"` + `data-confirm`, no inline style)
+- [x] 4.1 Admin-only confirmation page (own salt; token binds action, scope, admin id, assignment, process epoch, nonce; 10-min expiry; atomic nonce consumption) stating the row count + POST action that checks eligibility, grants the permission, and starts a new **scope-targeted** background pass; existing `_reindex_background` callers unchanged; WARNING with admin username and scope
+- [x] 4.2 Single-user: settings Danger zone control; multi-user: user edit page control; CSP rules (`data-*`, nonce, `type="button"` + `data-confirm`, no inline style)
 
 ## 5. Tests (D6)
 
-- [ ] 5.1 Unit tests per design D6
+- [ ] 5.1 Unit tests per design D6 (panel part done: `tests/test_issue_309_panel_confirm_empty.py`, CSP route/template inventories)
 - [ ] 5.2 Real-Postgres tests per design D6
 
 ## 6. Docs
 
-- [ ] 6.1 `docs/architecture/indexing-and-embeddings.md` (prefix protection, indeterminate root, permission), `docs/architecture/control-panel.md` (the new action), `DEPLOYMENT.md` pitfall + L1, `docs/deployment-kubernetes.md` troubleshooting row, `CLAUDE.md` key-decisions bullet
+- [ ] 6.1 `docs/architecture/indexing-and-embeddings.md` (prefix protection, indeterminate root, permission), `docs/architecture/control-panel.md` (the new action — done), `DEPLOYMENT.md` pitfall + L1, `docs/deployment-kubernetes.md` troubleshooting row, `CLAUDE.md` key-decisions bullet
 
 ## 7. Gates
 
