@@ -273,7 +273,13 @@ update it in the same change.** What stays here is the short list:
   reset. Never turn it into a non-200: `/health` is the liveness probe, and a
   restart cannot fix vault content. In single-user mode an index failure no
   longer skips the embed stage, and `cleanup_expired_tokens` runs in the
-  tick's `finally`.
+  tick's `finally`. A note whose own write fails with SQLSTATE class 22 or
+  54000 (move, upsert row, keyword vector at the floor, links) is
+  **quarantined**: the attempt rolls back, the pass re-runs without it (≤
+  `INDEXER_QUARANTINE_RETRIES_PER_TICK`, 5), and while its hash is unchanged
+  it is absent from the index — row deleted, never served stale — without
+  being a read failure or failing the pass. In-process; the full keyword
+  rebuild is excluded and stays atomic.
 - **The vector index is a `halfvec` expression index** (#283, migration 027),
   defined once in `src/services/vector_index.py` and excluded from `alembic
   check` by `include_object`; queries cast to match it and re-rank by

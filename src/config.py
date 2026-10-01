@@ -351,6 +351,10 @@ class Settings(BaseSettings):
     # enumeration) at which `/health` reports `degraded` and the CRITICAL
     # "manual intervention required" line is logged once (#308, D4).
     indexer_degraded_after_failures: int = Field(3, ge=1)
+    # How many times one invocation of an index pass may roll back and re-run
+    # a scope after quarantining a poison note (#308, D3). Beyond it the pass
+    # fails as an ordinary failure; the notes already quarantined stay so.
+    indexer_quarantine_retries_per_tick: int = Field(5, ge=0)
     # The scan's stat shortcut (#282): skip reading and hashing a note whose
     # current `(size, mtime_ns, ctime_ns, inode)` equals the tuple recorded for
     # the bytes that produced its row. Safe on local Linux filesystems (every

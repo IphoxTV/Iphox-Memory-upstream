@@ -1006,6 +1006,7 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `SECRET_KEY` | — | itsdangerous signer key |
 | `INDEX_INTERVAL_SECONDS` | `300` | Periodic reindex cadence |
 | `INDEXER_DEGRADED_AFTER_FAILURES` | `3` | Consecutive failures of any indexer counter (a scope's index passes, its embed passes, its incomplete re-derives, or the tick's own user enumeration) at which `/health` reports `degraded` and one CRITICAL "manual intervention required" line is logged. |
+| `INDEXER_QUARANTINE_RETRIES_PER_TICK` | `5` | How many times one index pass may roll back and re-run a scope after quarantining a note the database refuses (a data-exception or program-limit error on its row, keyword vector, move or links). Beyond it the pass fails as an ordinary failure; the notes already found stay quarantined for the next tick. |
 | `MULTI_USER_MODE` | `false` | In-app login, per-user vaults. See [Multi-user mode](#multi-user-mode). |
 | `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS` | `10` | How long the vault-root overlap check waits on one root before giving up on it. Expiry quarantines that one account (`root unexaminable`) and the check carries on, so a hung mount cannot hold up startup. Multi-user mode only. |
 | `MCP_HOSTNAME` | — | Public hostname. Derives `BASE_URL`, `ALLOWED_ORIGINS` and `ALLOWED_HOSTS` as `https://<host>`. Required (or `BASE_URL`) for the transfer tools. |

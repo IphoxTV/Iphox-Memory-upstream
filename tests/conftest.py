@@ -35,6 +35,7 @@ SETTINGS_ENV_KEYS = (
     "SECRET_KEY",
     "INDEX_INTERVAL_SECONDS",
     "INDEXER_DEGRADED_AFTER_FAILURES",
+    "INDEXER_QUARANTINE_RETRIES_PER_TICK",
     # The scan's stat shortcut and its backstop (#282).
     "INDEX_STAT_SHORTCUT",
     "INDEX_FULL_HASH_INTERVAL_HOURS",
@@ -309,6 +310,20 @@ def _reset_indexer_health():
     indexer_health.reset()
     yield
     indexer_health.reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_note_quarantine():
+    """Start every test with an empty poison-note quarantine (#308, D3).
+
+    In-process state keyed by `(owner, path)`; two tests that both use
+    `Bad.md` must not see each other's entry.
+    """
+    from src.services import indexer
+
+    indexer.clear_quarantine()
+    yield
+    indexer.clear_quarantine()
 
 
 def pytest_configure(config):

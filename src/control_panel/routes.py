@@ -2995,9 +2995,10 @@ async def _reindex_background(full_hash: bool = False):
             for uid in await _active_user_ids():
                 async with record_indexer_run("manual", uid) as stats:
                     try:
-                        stats.record_index(
-                            await index_vault(user_id=uid, full_hash=full_hash)
+                        index_result = await index_vault(
+                            user_id=uid, full_hash=full_hash
                         )
+                        stats.record_index(index_result)
                     except Exception as e:
                         stats.record_error("index", e)
                         # #308 D4: the panel is an entrypoint like any other;
@@ -3011,7 +3012,7 @@ async def _reindex_background(full_hash: bool = False):
                             error_type=type(e).__name__,
                         )
                     else:
-                        record_index_outcome(uid, True)
+                        record_index_outcome(uid, True, index_result)
                     try:
                         embedded = await embed_vault(user_id=uid)
                     except Exception as e:
@@ -3033,11 +3034,12 @@ async def _reindex_background(full_hash: bool = False):
                 # failing loudly to the background task, and its outcome still
                 # reaches the `/health` counters (#308 D4).
                 try:
-                    stats.record_index(await index_vault(full_hash=full_hash))
+                    index_result = await index_vault(full_hash=full_hash)
+                    stats.record_index(index_result)
                 except Exception:
                     record_index_outcome(None, False)
                     raise
-                record_index_outcome(None, True)
+                record_index_outcome(None, True, index_result)
                 try:
                     embedded = await embed_vault()
                 except Exception:

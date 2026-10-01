@@ -389,7 +389,7 @@ the survey and is seen by it.
 | # | Lock | Who takes it |
 | --- | --- | --- |
 | 1 | `ACCOUNT_GUARD_LOCK_KEY` | `users._lock_admin_guard` (admin handlers), `routes.change_password`, `session.start_session` (mint) — each **alone**; and `indexer.rebuild_tsvectors_all_scopes`, which then takes 2. |
-| 2 | `INDEX_GENERATION_LOCK_KEY` (via `acquire_generation_lock_unbounded` on the waiting paths) | `indexer._index_vault_pinned`, `embeddings._generation_matches`, `routes.reset_embeddings`, `routes.trigger_reembed`, `scripts/reset_embeddings.py` — each **alone**; and `indexer._rebuild_all_scopes_locked`, reached only from 1's holder. |
+| 2 | `INDEX_GENERATION_LOCK_KEY` (via `acquire_generation_lock_unbounded` on the waiting paths) | `indexer._index_vault_attempt`, `embeddings._generation_matches`, `routes.reset_embeddings`, `routes.trigger_reembed`, `scripts/reset_embeddings.py` — each **alone**; and `indexer._rebuild_all_scopes_locked`, reached only from 1's holder. |
 | 3 | row locks | inside each per-scope rebuild. |
 
 **One direction everywhere.** The maintenance rebuild is the only holder of the
