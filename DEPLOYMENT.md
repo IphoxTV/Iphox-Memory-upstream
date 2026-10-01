@@ -652,7 +652,19 @@ deployment; on a compose-file deployment the equivalents are plain
 - **Health.** `curl -s https://your-hostname/health` returns `status`
   plus `transfer_mount_check_available` and
   `vault_named_staging_fallback_active` — the two capability facts that
-  are otherwise only visible in the startup log.
+  are otherwise only visible in the startup log — and an `indexer`
+  object. `status` is `"degraded"` when the indexer task has died, a
+  counter (a scope's consecutive failed index or embed passes, its
+  incomplete re-derives, or the tick's user enumeration) has reached
+  `INDEXER_DEGRADED_AFTER_FAILURES` (default 3), or a note is
+  quarantined. **The HTTP code is 200 either way**, deliberately: the
+  Kubernetes manifests use `/health` as the liveness probe, and a
+  restart loop cannot fix vault content or a provider outage. So point
+  your uptime monitor at the **`status` field** — a keyword check for
+  `"status":"ok"` or a JSON-path check — not at the status code, or a
+  failing indexer stays invisible (#308: 8.5 days of failed passes
+  under a `200 ok`). The body carries counts only; the offending path
+  is in the log and on `/admin/health`.
 - **Upgrades.** Check the upgrade note at the top of this guide first,
   then pull, rebuild, and bring the stack up again; migrations
   run on start. After a release that carries one, confirm the schema

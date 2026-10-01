@@ -392,6 +392,16 @@ origin the mint tools refuse rather than emit a localhost link.
   mount check transfer writes need) and
   `vault_named_staging_fallback_active` (a write has actually staged
   under a name on this process).
+- `/health` also carries an `indexer` object (`status`, `task_running`,
+  `failing_scopes`, `embedding_failing_scopes`,
+  `max_consecutive_failures`, `quarantined_notes`, `last_success_at`),
+  and the top-level `status` becomes `"degraded"` when the indexer task
+  has died, any index, embedding or enumeration failure counter reaches
+  `INDEXER_DEGRADED_AFTER_FAILURES`, or a note is quarantined. **The HTTP
+  code stays 200** — a restart cannot repair vault content or a provider
+  outage, and Kubernetes uses `/health` for liveness — so **monitor the
+  `status` field** (a keyword or JSON check for `"status":"ok"`), not
+  the status code. Counts only: no path, error text or user id.
 
 Every write — note tools, `write_file`, uploads and imports — stages
 the new bytes in a temporary inode, `fsync`s them, and only then
@@ -995,6 +1005,7 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `VAULT_PATH` | `/obsidian` | In-container vault mount |
 | `SECRET_KEY` | — | itsdangerous signer key |
 | `INDEX_INTERVAL_SECONDS` | `300` | Periodic reindex cadence |
+| `INDEXER_DEGRADED_AFTER_FAILURES` | `3` | Consecutive failures of any indexer counter (a scope's index passes, its embed passes, its incomplete re-derives, or the tick's own user enumeration) at which `/health` reports `degraded` and one CRITICAL "manual intervention required" line is logged. |
 | `MULTI_USER_MODE` | `false` | In-app login, per-user vaults. See [Multi-user mode](#multi-user-mode). |
 | `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS` | `10` | How long the vault-root overlap check waits on one root before giving up on it. Expiry quarantines that one account (`root unexaminable`) and the check carries on, so a hung mount cannot hold up startup. Multi-user mode only. |
 | `MCP_HOSTNAME` | — | Public hostname. Derives `BASE_URL`, `ALLOWED_ORIGINS` and `ALLOWED_HOSTS` as `https://<host>`. Required (or `BASE_URL`) for the transfer tools. |

@@ -319,8 +319,8 @@ text) alone; the fingerprint names the model.
   because `semantic_search` is bimodal (≈0.47 s warm, ≈17.5 s cold: 14 s of
   Ollama reloading bge-m3, 3 s of HNSW pages missing from a 128 MB shared
   `shared_buffers`) and the median gap between calls has grown to ~28 min.
-  It logs and swallows ordinary failures (the indexer's `consecutive_failures`
-  must not react to it) but **re-raises `CancelledError`** so lifespan shutdown
+  It logs and swallows ordinary failures (the indexer's failure counters in
+  `indexer_health` must not react to it) but **re-raises `CancelledError`** so lifespan shutdown
   still stops the loop. Since #283 the probe (`probe_statement()`) orders by
   `vector_index.order_expr` — the same half-precision expression the two
   vector queries order by — so it warms the `halfvec` index the search

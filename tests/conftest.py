@@ -34,6 +34,7 @@ SETTINGS_ENV_KEYS = (
     "VAULT_PATH",
     "SECRET_KEY",
     "INDEX_INTERVAL_SECONDS",
+    "INDEXER_DEGRADED_AFTER_FAILURES",
     # The scan's stat shortcut and its backstop (#282).
     "INDEX_STAT_SHORTCUT",
     "INDEX_FULL_HASH_INTERVAL_HOURS",
@@ -294,6 +295,20 @@ def unpublished_vault_root_snapshot():
     vault_overlap.reset_snapshot_state()
     yield
     vault_overlap.reset_snapshot_state()
+
+
+@pytest.fixture(autouse=True)
+def _reset_indexer_health():
+    """Start every test with clean indexer failure accounting (#308, D4).
+
+    The registry is process state, like the indexer loop it describes; a test
+    that drives a failing tick must not leave `/health` degraded for the next.
+    """
+    from src.services import indexer_health
+
+    indexer_health.reset()
+    yield
+    indexer_health.reset()
 
 
 def pytest_configure(config):

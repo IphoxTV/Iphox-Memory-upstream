@@ -263,6 +263,17 @@ update it in the same change.** What stays here is the short list:
   stays due until one commits with no read failure — so an edit that keeps all
   four stat fields is found within that interval (perf-L3).
   `INDEX_STAT_SHORTCUT=false` for network/FUSE/FAT vault mounts.
+- **Indexer failure is counted and reaches `/health`; HTTP stays 200** (#308).
+  `src/services/indexer_health.py` holds per-scope consecutive index/embed
+  failures and incomplete re-derives, a tick-level enumeration counter and
+  "task not running", updated from **every** entrypoint (startup, periodic in
+  both modes, panel Reindex). Any counter at `INDEXER_DEGRADED_AFTER_FAILURES`
+  (3), a dead task or a quarantined note makes `/health` `status: "degraded"`
+  — counts only, no path/error/user id — and logs one CRITICAL, re-armed on
+  reset. Never turn it into a non-200: `/health` is the liveness probe, and a
+  restart cannot fix vault content. In single-user mode an index failure no
+  longer skips the embed stage, and `cleanup_expired_tokens` runs in the
+  tick's `finally`.
 - **The vector index is a `halfvec` expression index** (#283, migration 027),
   defined once in `src/services/vector_index.py` and excluded from `alembic
   check` by `include_object`; queries cast to match it and re-rank by

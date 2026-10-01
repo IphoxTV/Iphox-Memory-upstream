@@ -52,6 +52,7 @@ from src.services.embeddings import (
     embed_note,
 )
 from src.services.fts import index_tsvector_sql
+from src.services import indexer_health
 from src.services.rate_limits import flush_expired
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
@@ -480,7 +481,7 @@ class VaultRootQuarantined(RuntimeError):
     """
 
 
-async def detect_root_overlaps(where: str) -> None:
+async def detect_root_overlaps(where: str) -> bool:
     """Publish a quarantine snapshot before this entry point begins a pass.
 
     **Called before `index_pass_lock` is taken**, deliberately: the check must
@@ -496,6 +497,9 @@ async def detect_root_overlaps(where: str) -> None:
     still stands (retained, never cleared) or nothing has been published and
     `_refuse_quarantined_pass` refuses every multi-user stage until some later
     entry point publishes one.
+
+    Returns whether detection succeeded, so the indexer loop can count a
+    failure toward its tick-level (enumeration) counter (#308, D4).
     """
     try:
         await vault_overlap.detect_and_publish()
@@ -506,6 +510,8 @@ async def detect_root_overlaps(where: str) -> None:
             where,
             e,
         )
+        return False
+    return True
 
 
 def _refuse_quarantined_pass(user_id: int | None, stage: str) -> None:
@@ -5987,6 +5993,45 @@ async def prewarm_search_caches() -> None:
         )
 
 
+def _embed_failures(result) -> int:
+    """How many notes an embed pass failed, for `indexer_health`.
+
+    `embed_vault` is monkeypatched with plain no-op coroutines throughout the
+    tests, so anything that is not an `EmbedPassResult` reports none.
+    """
+    if isinstance(result, EmbedPassResult):
+        return result.failures
+    return 0
+
+
+def record_index_outcome(user_id: int | None, ok: bool) -> None:
+    """Record one index stage's outcome for `indexer_health` (#308, D4).
+
+    Every entrypoint calls this — the startup pass, the periodic tick in both
+    modes, and the panel's Reindex now — so the counters mean the same thing
+    whichever path ran the pass. `ok` means `index_vault` returned without
+    raising (a pass that quarantined a note returned, so it counts as ok).
+    """
+    indexer_health.record_index(user_id, ok)
+    if ok:
+        # TODO(#308 D8 wiring): `index_vault` does not yet expose whether a
+        # re-derive withheld its provenance stamp. Until it does, a returning
+        # pass is recorded as "not a re-derive" (which resets the counter);
+        # the D8 slice replaces `None` with the pass's own verdict.
+        indexer_health.record_rederive(user_id, None)
+
+
+def record_embed_outcome(
+    user_id: int | None, result=None, *, raised: bool = False
+) -> None:
+    """Record one embed stage's outcome for `indexer_health` (#308, D4).
+
+    A stage that raised counts as one failed embed pass; one that returned
+    counts its `EmbedPassResult.failures`.
+    """
+    indexer_health.record_embed(user_id, 1 if raised else _embed_failures(result))
+
+
 async def _index_pass_once(user_id: int | None, trigger: str = "scheduled") -> bool:
     """One full index + embed pass for a single user (or single-user mode).
 
@@ -6001,6 +6046,11 @@ async def _index_pass_once(user_id: int | None, trigger: str = "scheduled") -> b
     A pass that swallowed a failure and recorded a clean row would reproduce
     the same defect one layer down: the log line scrolls away, the row is what
     survives a redeploy.
+
+    Used for single-user mode too (`user_id=None`, #308 D9): a failed index
+    stage used to jump past the embed stage there, so committed rows went
+    unembedded for as long as the index kept failing. Each stage's outcome is
+    recorded in `indexer_health` so both modes count failures identically.
     """
     ok = True
     async with record_indexer_run(trigger, user_id) as stats:
@@ -6009,13 +6059,20 @@ async def _index_pass_once(user_id: int | None, trigger: str = "scheduled") -> b
         except Exception as e:
             ok = False
             stats.record_error("index", e)
+            record_index_outcome(user_id, False)
             logger.error(f"Index failed (user_id={user_id}): {e}")
+        else:
+            record_index_outcome(user_id, True)
         try:
-            stats.record_embedded(await embed_vault(user_id=user_id))
+            embedded = await embed_vault(user_id=user_id)
         except Exception as e:
             ok = False
             stats.record_error("embed", e)
+            record_embed_outcome(user_id, raised=True)
             logger.error(f"Embedding failed (user_id={user_id}): {e}")
+        else:
+            stats.record_embedded(embedded)
+            record_embed_outcome(user_id, embedded)
     return ok
 
 
@@ -6025,13 +6082,18 @@ async def run_indexer_loop():
     Multi-user mode iterates active users sequentially per pass (v1 simplicity;
     parallelism can come later). Single-user mode runs one legacy pass with
     `user_id=None`.
+
+    Failure accounting lives in `indexer_health` (#308, D4): per scope from
+    every stage, plus a tick-level counter for work not attributable to a
+    scope (overlap detection, user enumeration, a tick that raised outside
+    every scope's stages). `/health` reads it.
     """
     # E2 — the startup pass. Before `index_pass_lock`, so the check does not
     # queue behind the pass it gates. The lifespan (E1) has normally published
     # one already; this is not redundant, because `run_indexer_loop` is started
     # by paths that are not the lifespan in tests and could be in future, and a
     # second detection here costs N bounded root observations.
-    await detect_root_overlaps("startup")
+    startup_overlap_ok = await detect_root_overlaps("startup") is not False
     # Hold `index_pass_lock` for the initial pass too, so a panel-triggered
     # `_reindex_background` fired during startup is serialized against it.
     startup_ok = True
@@ -6060,7 +6122,10 @@ async def run_indexer_loop():
                     except Exception as e:
                         startup_ok = False
                         stats.record_error("index", e)
+                        record_index_outcome(uid, False)
                         logger.error(f"Initial index failed (user_id={uid}): {e}")
+                    else:
+                        record_index_outcome(uid, True)
                     try:
                         # The backfill writes its own `backfill` row; the note
                         # here is so an operator reading a startup row sees
@@ -6071,11 +6136,15 @@ async def run_indexer_loop():
                         stats.record_error("link backfill", e)
                         logger.error(f"Link backfill failed (user_id={uid}): {e}")
                     try:
-                        stats.record_embedded(await embed_vault(user_id=uid))
+                        embedded = await embed_vault(user_id=uid)
                     except Exception as e:
                         startup_ok = False
                         stats.record_error("embed", e)
+                        record_embed_outcome(uid, raised=True)
                         logger.error(f"Initial embedding failed (user_id={uid}): {e}")
+                    else:
+                        stats.record_embedded(embedded)
+                        record_embed_outcome(uid, embedded)
                 # After this user's whole sequence, success or failure, and
                 # **outside** the recorder's context so its own short session
                 # has closed first.
@@ -6087,7 +6156,10 @@ async def run_indexer_loop():
                 except Exception as e:
                     startup_ok = False
                     stats.record_error("index", e)
+                    record_index_outcome(None, False)
                     logger.error(f"Initial index failed: {e}")
+                else:
+                    record_index_outcome(None, True)
 
                 try:
                     await link_backfill_pass()
@@ -6097,18 +6169,22 @@ async def run_indexer_loop():
                     logger.error(f"Link backfill failed: {e}")
 
                 try:
-                    stats.record_embedded(await embed_vault())
+                    embedded = await embed_vault()
                 except Exception as e:
                     startup_ok = False
                     stats.record_error("embed", e)
+                    record_embed_outcome(None, raised=True)
                     logger.error(f"Initial embedding failed: {e}")
+                else:
+                    stats.record_embedded(embedded)
+                    record_embed_outcome(None, embedded)
 
+    indexer_health.record_enumeration(startup_overlap_ok)
     # The startup pass counts as a run: it does the same work a tick does, and
     # without it the dashboard would read "Never" for a whole interval after
     # every restart.
     _record_index_run(startup_ok)
 
-    consecutive_failures = 0
     logger.info(
         f"Periodic indexer loop armed (interval={settings.index_interval_seconds}s, "
         f"multi_user={settings.multi_user_mode})"
@@ -6116,7 +6192,7 @@ async def run_indexer_loop():
     while True:
         await asyncio.sleep(settings.index_interval_seconds)
         logger.info("Periodic indexer tick")
-        # The whole tick body is guarded so the refusal flush below runs on
+        # The whole tick body is guarded so the housekeeping below runs on
         # **every** path out of it — see the `finally`.
         try:
             # E3 — every periodic iteration, **before** the pause check and
@@ -6125,9 +6201,10 @@ async def run_indexer_loop():
             # the pause is entered precisely when an operator is doing
             # something destructive and watching the panel, which is the worst
             # moment for a quarantine to go unpublished and unrecorded.
-            await detect_root_overlaps("periodic")
+            overlap_ok = await detect_root_overlaps("periodic") is not False
             if _is_paused():
                 logger.info("Periodic tick skipped (paused)")
+                indexer_health.record_enumeration(overlap_ok)
                 # The snapshot has been published and the ERROR logged; the run
                 # rows are the half that survives a restart, so a paused
                 # iteration writes them before it returns. No index or embed
@@ -6145,7 +6222,11 @@ async def run_indexer_loop():
                         # newly-deactivated users are picked up without a restart.
                         # One user's failure does not abort the others, but it
                         # does make the whole tick a failed run.
-                        for uid in await _rotated_user_ids():
+                        uids = await _rotated_user_ids()
+                        # A user no longer active must not hold `/health` at
+                        # degraded with counts from their last passes.
+                        indexer_health.retain_scopes(uids)
+                        for uid in uids:
                             if not await _index_pass_once(uid):
                                 tick_ok = False
                             # Advanced whether the pass succeeded or failed: the
@@ -6154,22 +6235,20 @@ async def run_indexer_loop():
                             # starve every tenant after them.
                             await _advance_rotation_cursor(uid)
                     else:
-                        # Not routed through `_index_pass_once`: that helper
-                        # swallows per-stage exceptions so one user cannot stop the
-                        # others, and in single-user mode a raising pass must reach
-                        # the outer handler so `consecutive_failures` sees it. The
-                        # run row is still written — `record_indexer_run` records
-                        # the exception on its way past.
-                        async with record_indexer_run("scheduled", None) as stats:
-                            stats.record_index(await index_vault())
-                            stats.record_embedded(await embed_vault())
+                        # Through `_index_pass_once`, like every tenant in
+                        # multi-user mode (#308 D9): a failed index stage is
+                        # recorded and the embed stage still runs over the rows
+                        # already committed. The per-stage outcome reaches
+                        # `indexer_health`, which replaces the old loop-local
+                        # `consecutive_failures`.
+                        if not await _index_pass_once(None):
+                            tick_ok = False
                     # Still under the lock: serialised against a panel reindex and
                     # against reset-embeddings, which also takes this lock. It
-                    # never raises, so `consecutive_failures` cannot react to it,
-                    # and it delays the next tick by at most PREWARM_TIMEOUT_SECONDS.
+                    # never raises, and it delays the next tick by at most
+                    # PREWARM_TIMEOUT_SECONDS.
                     await prewarm_search_caches()
-                await cleanup_expired_tokens()
-                consecutive_failures = 0
+                indexer_health.record_enumeration(overlap_ok)
                 # Heartbeat: the tick completed. Recorded whether or not the pass
                 # found anything to index — that is the whole point (#78) — but
                 # `tick_ok` is False if any per-user pass swallowed an exception,
@@ -6177,16 +6256,29 @@ async def run_indexer_loop():
                 # healthy just because the loop itself survived.
                 _record_index_run(tick_ok)
             except Exception as e:
-                consecutive_failures += 1
+                # Reached only by work no scope owns — user enumeration, a run
+                # row that could not be opened, the rotation cursor — so it is
+                # counted on the tick-level counter, which logs the CRITICAL
+                # line once when it reaches `INDEXER_DEGRADED_AFTER_FAILURES`.
+                indexer_health.record_enumeration(False)
                 # A tick that raised still *ran*; the dashboard says so and marks
                 # it failed rather than showing a stale-looking success.
                 # `CancelledError` is a BaseException and does not land here, so
                 # lifespan shutdown is not recorded as a failed pass.
                 _record_index_run(False)
-                logger.error(f"Periodic task failed ({consecutive_failures} consecutive): {e}")
-                if consecutive_failures >= 5:
-                    logger.critical("Indexer has failed 5+ consecutive times — manual intervention required")
+                logger.error(f"Periodic task failed: {e}")
         finally:
+            # The token, authorization-code and unused-OAuth-client sweep.
+            # **In the `finally`, in its own `try`** (#308 D9): it is the only
+            # caller of those sweeps, and it used to sit after the pass, which
+            # only a healthy tick reaches — so a failing indexer also stopped
+            # expiring credentials. A failure here is housekeeping and never
+            # fails the tick. `CancelledError` is not an `Exception` and
+            # propagates, so lifespan shutdown is unaffected.
+            try:
+                await cleanup_expired_tokens()
+            except Exception as e:  # noqa: BLE001 - housekeeping, never fatal
+                logger.error(f"Expired-token cleanup failed: {e}")
             # The refusal coalescer's standalone flush: any window that closed
             # since the last tick writes the row it owes, so a principal that
             # was refused in a burst and then went quiet still has its count
@@ -6195,7 +6287,7 @@ async def run_indexer_loop():
             #
             # **In the `finally`, so every path out of the tick reaches it.**
             # It used to sit after `cleanup_expired_tokens()`, which only a
-            # *healthy* tick reaches: a paused tick `continue`s above it and a
+            # *healthy* tick reached: a paused tick `continue`s above it and a
             # failing tick jumps past it into the handler, so on a deployment
             # that was paused, or failing, the counts accumulated in memory and
             # were written only if the process happened to shut down cleanly.
