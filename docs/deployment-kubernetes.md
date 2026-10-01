@@ -180,6 +180,14 @@ vault. The startup probe allows five minutes for the database checks and the
 first vault-root snapshot. The readiness and liveness probes use the same
 endpoint.
 
+**`/health` returns 200 even when it reports `"status": "degraded"`.** That
+happens when the indexer keeps failing, its task has stopped, or a note is
+quarantined. A restart cannot fix vault content, so the probes deliberately
+ignore it. Alert on the JSON instead, for example
+`curl -s -H 'Host: localhost' http://<pod>:8000/health | jq -e '.status == "ok"'`
+or a keyword monitor on `"status":"ok"`. The `indexer` object carries counts
+only, never paths or user ids.
+
 **One volume per vault, mounted at the vault root.** See the next sections.
 
 ## Configuration
@@ -250,6 +258,8 @@ List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 | `INDEX_INTERVAL_SECONDS` | `300` | Periodic index pass. |
 | `INDEX_STAT_SHORTCUT` | `true` | Skip unchanged files by `(size, mtime, ctime, inode)`. **Set `false` for NFS, SMB, FUSE or FAT vault volumes.** |
 | `INDEX_FULL_HASH_INTERVAL_HOURS` | `24` | Backstop full-hash pass. One also runs at startup and on panel Reindex. |
+| `INDEXER_DEGRADED_AFTER_FAILURES` | `3` | Consecutive failed index, embedding or re-derive passes before `/health` reports `degraded`. |
+| `INDEXER_QUARANTINE_RETRIES_PER_TICK` | `5` | Re-runs per user per pass while isolating notes whose database writes fail on their own data. |
 | `FTS_CONFIGS` | `english` | Postgres text-search configs for keyword search. A change needs `rebuild-tsvectors`. |
 | `EMBED_CHUNK_BUDGET_PER_USER` | `5000` | Chunks embedded per user per pass (multi-user fairness). |
 | `EMBED_TIME_BUDGET_SECONDS_PER_USER` | `300` | Seconds of embedding per user per pass. |
@@ -564,6 +574,7 @@ curl -si https://$H/admin | head -1            # SSO redirect or refusal, never 
 curl -si https://$H/api/x | head -1            # same
 curl -si https://$H/mcp | head -1              # 401 from the app
 curl -si https://$H/health | head -1           # 200
+curl -s https://$H/health | jq -r .status      # ok (degraded = see the indexer object)
 curl -si -H 'Authorization: Bearer x' https://$H/ | head -1   # 401 from the app
 curl -si https://$H/ | head -1                 # 404
 curl -si http://$H/mcp | grep -iE '^HTTP|^location'           # refused, NO Location
