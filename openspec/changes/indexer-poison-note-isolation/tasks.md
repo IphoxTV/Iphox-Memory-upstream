@@ -42,6 +42,6 @@
 
 ## 5. Gates
 
-- [ ] 5.1 `pytest tests` and `make test-integration` green
-- [ ] 5.2 `openspec-verifier` pass; adversarial Codex review (indexing path is a mandatory trigger)
+- [x] 5.1 `pytest tests` and `make test-integration` green
+- [x] 5.2 `openspec-verifier` pass; adversarial Codex review (indexing path is a mandatory trigger)
 - [ ] 5.3 Deploy; end-to-end: plant a NUL note in the live vault, confirm it indexes, `keyword_search` finds it, `/health` stays ok; remove it
