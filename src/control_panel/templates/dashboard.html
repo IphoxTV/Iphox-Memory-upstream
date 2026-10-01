@@ -88,7 +88,10 @@
 
             <div class="dash-health-cell">
                 <span class="dash-health-label">Last pass</span>
-                {% if health.last_run and health.last_run.error %}
+                {% if health.last_run and health.last_run.error and health.last_run.outcome == 'quarantined' %}
+                    {# A pass that quarantined notes succeeded; its run record names them (#308). #}
+                    <a href="/admin/health#run-{{ health.last_run.id }}" class="badge badge-yellow u-text-decoration-none" title="The pass succeeded without one or more notes the database refused.">quarantined</a>
+                {% elif health.last_run and health.last_run.error %}
                     <a href="/admin/health#run-{{ health.last_run.id }}" class="badge badge-red u-text-decoration-none">failed</a>
                 {% elif health.last_run %}
                     <span class="badge badge-green">ok</span>

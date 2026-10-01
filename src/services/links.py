@@ -725,6 +725,12 @@ def extract_links_bounded(
         target = m.group("target").strip()
         if not target:
             continue
+        # A NUL anywhere in the link — target, anchor or alias — makes it not
+        # a link (#308, D2). Removing it would name a different note, and
+        # keeping it cannot be stored. After the indexer's decode-point removal
+        # a body has none; the rule is stated here so it holds for any input.
+        if "\x00" in m.group(0):
+            continue
         if max_links is not None and len(wiki) >= max_links:
             overflowed = True
             break
@@ -754,6 +760,17 @@ def extract_links_bounded(
             decoded = urllib.parse.unquote(href)
         except Exception:
             decoded = href
+        # A percent-encoded NUL (`[x](bad%00target.md)`) decodes to U+0000
+        # from NUL-free text. Dropping the character would *invent* a link to
+        # `badtarget.md`, a different file, so the whole link is dropped, as an
+        # empty href is (#308, D2) — and likewise for a raw NUL in the label.
+        # The anchor is never decoded or stored apart from `link_text`, which
+        # keeps its `%00` as three characters, so it is left alone: dropping
+        # `[x](a.md#%00)` would change rows that are storable today, which is
+        # an extraction-version bump this change deliberately does not make.
+        # Neither dropped form could ever have been stored, so no row changes.
+        if "\x00" in decoded or "\x00" in link.text:
+            continue
         # Strip a trailing `.md` for resolver consistency — resolver tries
         # both with and without the extension.
         target = decoded[:-3] if decoded.endswith(".md") else decoded

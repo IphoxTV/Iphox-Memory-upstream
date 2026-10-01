@@ -389,7 +389,7 @@ the survey and is seen by it.
 | # | Lock | Who takes it |
 | --- | --- | --- |
 | 1 | `ACCOUNT_GUARD_LOCK_KEY` | `users._lock_admin_guard` (admin handlers), `routes.change_password`, `session.start_session` (mint) — each **alone**; and `indexer.rebuild_tsvectors_all_scopes`, which then takes 2. |
-| 2 | `INDEX_GENERATION_LOCK_KEY` (via `acquire_generation_lock_unbounded` on the waiting paths) | `indexer._index_vault_pinned`, `embeddings._generation_matches`, `routes.reset_embeddings`, `routes.trigger_reembed`, `scripts/reset_embeddings.py` — each **alone**; and `indexer._rebuild_all_scopes_locked`, reached only from 1's holder. |
+| 2 | `INDEX_GENERATION_LOCK_KEY` (via `acquire_generation_lock_unbounded` on the waiting paths) | `indexer._index_vault_attempt`, `embeddings._generation_matches`, `routes.reset_embeddings`, `routes.trigger_reembed`, `scripts/reset_embeddings.py` — each **alone**; and `indexer._rebuild_all_scopes_locked`, reached only from 1's holder. |
 | 3 | row locks | inside each per-scope rebuild. |
 
 **One direction everywhere.** The maintenance rebuild is the only holder of the
@@ -872,10 +872,17 @@ highest — and never toward discarding, which costs a full re-embed.
   `_is_lock_not_available` walks `.orig` *and* `__cause__` — the SQLSTATE lives
   on asyncpg's own error, two layers down, exactly as `_log_usage`'s FK
   recovery has to walk.
-- **A re-derive that skipped anything records nothing.** Any per-file skip —
-  including both link-extraction skips, the missing buffered body and the
-  missing index row — withholds the stamp, because the record's whole claim is
-  that every surviving row was written by that pass.
+- **A re-derive that skipped anything that could hide a row records
+  nothing.** A per-file skip on a path with a row in the locked rows, an
+  unlistable directory, a C5 deferral, and both link-extraction skips, the
+  missing buffered body and the missing index row (paths already selected for
+  upsert) withhold the stamp, because the record's whole claim is that every
+  surviving row was written by that pass. A read skip on a path with **no**
+  row cannot hide one and does not withhold (#308 D8) — before that, one
+  never-indexed unreadable file held the scope in re-derive, a full-scope
+  rewrite every tick. A present-but-not-indexable path (an undecodable file,
+  an unencodable or over-long name) is not a skip: its row is deleted in the
+  pass (#308 D7). See [indexing and embeddings](indexing-and-embeddings.md).
 - **`embed_vault` is deliberately ungated on provenance, because it verifies.**
   Gating it composed with the completeness rule into indefinite staleness: one
   permanently unreadable file withholds the record forever and would then

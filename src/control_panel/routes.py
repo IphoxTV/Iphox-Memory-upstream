@@ -2976,7 +2976,8 @@ async def _reindex_background(full_hash: bool = False):
     # pass in the history took ten times as long as its neighbours.
     from src.services.indexer import (
         index_vault, embed_vault, _active_user_ids, detect_root_overlaps,
-        index_pass_lock, record_indexer_run,
+        index_pass_lock, record_indexer_run, record_index_outcome,
+        record_embed_outcome,
     )
     # E4 — **before `index_pass_lock` is taken.** Reindex Now, re-embed and
     # reset embeddings all land in this function, and it is a separate entry
@@ -2994,11 +2995,15 @@ async def _reindex_background(full_hash: bool = False):
             for uid in await _active_user_ids():
                 async with record_indexer_run("manual", uid) as stats:
                     try:
-                        stats.record_index(
-                            await index_vault(user_id=uid, full_hash=full_hash)
+                        index_result = await index_vault(
+                            user_id=uid, full_hash=full_hash
                         )
+                        stats.record_index(index_result)
                     except Exception as e:
                         stats.record_error("index", e)
+                        # #308 D4: the panel is an entrypoint like any other;
+                        # its outcome feeds the same `/health` counters.
+                        record_index_outcome(uid, False)
                         security_events.emit(
                             "panel_ondemand_index_failed",
                             level=logging.ERROR,
@@ -3006,10 +3011,13 @@ async def _reindex_background(full_hash: bool = False):
                             user_id=uid,
                             error_type=type(e).__name__,
                         )
+                    else:
+                        record_index_outcome(uid, True, index_result)
                     try:
-                        stats.record_embedded(await embed_vault(user_id=uid))
+                        embedded = await embed_vault(user_id=uid)
                     except Exception as e:
                         stats.record_error("embed", e)
+                        record_embed_outcome(uid, raised=True)
                         security_events.emit(
                             "panel_ondemand_embed_failed",
                             level=logging.ERROR,
@@ -3017,7 +3025,25 @@ async def _reindex_background(full_hash: bool = False):
                             user_id=uid,
                             error_type=type(e).__name__,
                         )
+                    else:
+                        stats.record_embedded(embedded)
+                        record_embed_outcome(uid, embedded)
         else:
             async with record_indexer_run("manual", None) as stats:
-                stats.record_index(await index_vault(full_hash=full_hash))
-                stats.record_embedded(await embed_vault())
+                # Recorded and re-raised: the single-user manual pass keeps
+                # failing loudly to the background task, and its outcome still
+                # reaches the `/health` counters (#308 D4).
+                try:
+                    index_result = await index_vault(full_hash=full_hash)
+                    stats.record_index(index_result)
+                except Exception:
+                    record_index_outcome(None, False)
+                    raise
+                record_index_outcome(None, True, index_result)
+                try:
+                    embedded = await embed_vault()
+                except Exception:
+                    record_embed_outcome(None, raised=True)
+                    raise
+                stats.record_embedded(embedded)
+                record_embed_outcome(None, embedded)

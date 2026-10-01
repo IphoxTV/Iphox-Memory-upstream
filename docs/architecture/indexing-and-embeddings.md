@@ -248,6 +248,13 @@ text) alone; the fingerprint names the model.
   every falsy title (`false`, `0`, `[]`, `{}`, `""` all fall back to the stem)
   and trusted a copy that can be older than the file. The JSONB derivation
   survives only as the read/parse-failure fallback, declared best-effort.
+- **Note text is NUL-free from the decode point on** (#308, D1/D2). See
+  [the section below](#nul-free-derivation-not-indexable-paths-and-the-re-derive-stamp-308).
+  PostgreSQL `text` cannot hold U+0000, and one NUL in a body failed the
+  keyword-vector UPDATE and rolled the owner's whole pass back every tick for
+  8.5 days. `read_note_at` removes it before hashing; the shared title and tag
+  rules and the JSONB boundary remove it from frontmatter-derived strings; a
+  link whose decoded target contains it is not a link.
 - **A non-finite frontmatter number is converted at each JSON boundary, never
   at the parse** (#154). It is valid YAML and invalid JSON, so left alone it
   aborts the whole batch; coerced at the parse it would rewrite the note's own
@@ -261,12 +268,17 @@ text) alone; the fingerprint names the model.
   characters — today's statement — with each attempt in its own savepoint and
   the `try` **outside** `async with session.begin_nested()`, so the error
   unwinds through the context manager's rollback and leaves the outer
-  transaction usable. A floor failure propagates, exactly as before: the
-  incremental pass aborts with nothing committed and retries next tick, and
-  `_rebuild_tsvectors_single_scope_for_tests` is now **atomic** — its every-500 intermediate commits
-  are gone, so a floor failure rolls the whole rebuild back instead of leaving
-  a keyword index half-built under two FTS configs that no periodic pass would
-  repair. Verified against a real PostgreSQL
+  transaction usable. A floor failure propagates out of the helper, and the
+  two callers then differ (#308, D3): in the **incremental pass** a floor
+  failure with a poison SQLSTATE (class 22 or 54000) **quarantines that note
+  and the pass re-runs without it**, committing the rest — see
+  [the quarantine](#the-poison-note-quarantine-308-d3-d5); any other floor
+  failure still aborts the pass with nothing committed. The **full rebuild**
+  (`_rebuild_tsvectors_single_scope_for_tests`, and the all-scopes driver) is
+  excluded from the quarantine and is **atomic** — its every-500 intermediate
+  commits are gone, so a floor failure rolls the whole rebuild back and
+  surfaces to the operator instead of leaving a keyword index half-built under
+  two FTS configs that no periodic pass would repair. Verified against a real PostgreSQL
   (`tests/integration/test_tsvector_bounded_pg.py`); a mocked savepoint cannot
   show the driver's aborted-transaction state clearing.
 - **The rebuild certifies what it writes, and the reason is that nothing else
@@ -319,8 +331,8 @@ text) alone; the fingerprint names the model.
   because `semantic_search` is bimodal (≈0.47 s warm, ≈17.5 s cold: 14 s of
   Ollama reloading bge-m3, 3 s of HNSW pages missing from a 128 MB shared
   `shared_buffers`) and the median gap between calls has grown to ~28 min.
-  It logs and swallows ordinary failures (the indexer's `consecutive_failures`
-  must not react to it) but **re-raises `CancelledError`** so lifespan shutdown
+  It logs and swallows ordinary failures (the indexer's failure counters in
+  `indexer_health` must not react to it) but **re-raises `CancelledError`** so lifespan shutdown
   still stops the loop. Since #283 the probe (`probe_statement()`) orders by
   `vector_index.order_expr` — the same half-precision expression the two
   vector queries order by — so it warms the `halfvec` index the search
@@ -560,13 +572,15 @@ record so the embed pass that follows sweeps.
 when a full-hash pass commits having **read and hashed every discovered
 file's bytes**, with no other path left unprocessed (Codex r2: the scan
 catches read and parse failures and still commits, so commit alone would let
-a skipped file hide for another interval). **Files that are not valid UTF-8
-do not block** (verifier, wave 1): their bytes were read in full and such a
-file is never indexed, so a full-hash pass every tick could verify nothing
-more; it is still a skip for the re-derive stamp and still logged. Everything
-else blocks — walk failures and read errors (`ScanResult.unverified`, plus
-C4's re-read), a missing buffered body, a parse failure, the keyword-vector
-and link-rebuild skips, a C5 deferral under re-derive. A pass that aborts, is
+a skipped file hide for another interval). **A present-but-not-indexable path
+does not block** (verifier, wave 1; generalised by #308 D7): a file whose
+bytes are not valid UTF-8 was read in full, and a path that is unencodable or
+over-long can never be indexed, so a full-hash pass every tick could verify
+nothing more. None of them is a skip at all any more — any row at such a path
+is deleted (see [#308](#nul-free-derivation-not-indexable-paths-and-the-re-derive-stamp-308)).
+Everything else blocks — walk failures and read errors (`ScanResult.unverified`,
+plus C4's re-read), a missing buffered body, a parse failure, the
+keyword-vector and link-rebuild skips, a C5 deferral under re-derive. A pass that aborts, is
 refused or cancelled, or commits with a blocking skip leaves the scope due,
 and every following pass for it is again a full-hash pass until one succeeds.
 A forced pass (`full_hash=True`) removes the scope's timestamp before any
@@ -625,6 +639,169 @@ Labelled `perf-L*` as in the change's design, so distinct from the #200–#206 `
   without triggering a sweep here. Bounded by the 24 h backstop sweep.
 - **perf-L7 — deferred rows.** C5 defers a row changed mid-walk to the next pass;
   that note's row, and its search presence, can lag by one extra pass.
+
+## NUL-free derivation, not-indexable paths and the re-derive stamp (#308)
+
+Two NUL bytes in two agent-written notes wedged one user's indexer for 8.5
+days: `text` cannot hold U+0000, the keyword-vector UPDATE raised
+`CharacterNotInRepertoireError` at the floor, the pass's one transaction rolled
+back, and every tick re-upserted and re-vectorised ~5,000 notes and threw the
+work away (~650 GB/day of writes). The third route to "one note takes its
+owner's index down" after #126 (title) and #154 (non-finite JSON). The rules
+below close the NUL route and two same-class routes a bug hunt found;
+[the per-note quarantine](#the-poison-note-quarantine-308-d3-d5) bounds the
+*class*.
+
+- **NUL is removed at the one decode point, before hashing** (D1).
+  `read_note_at` returns the text with every `\x00` removed and logs one
+  WARNING per read naming the vault-relative path and the count, never
+  content. Every indexer reader goes through it — the scan (`_read_and_hash`),
+  the C4 re-read and the raw-body fallback (`_rescan_one`), and via
+  `read_note_beneath` the embed backlog, the reconciliation sweep, the link
+  backfill and the tsvector rebuild — so the scan's `content_hash`, the embed
+  pass's `StaleCertification` check and the rebuild's certification are all
+  computed over the same text. **A perpetual re-index loop would need some
+  reader to strip and another not to**; keep every new reader on this
+  function. The indexer is the only writer of `notes_metadata.content_hash`.
+  A NUL-free note's text and hash are unchanged, so the deploy re-indexes
+  nothing. The file's bytes are never modified; `a\0b` is searchable as `ab`
+  (removal, not a space or U+FFFD — declared). Not stripping at each DB
+  boundary instead is deliberate: five-plus boundaries, and the one missed is
+  the next #308.
+- **Frontmatter-derived strings are NUL-free too** (D2), because YAML's
+  `"\0"` escape makes a NUL from NUL-free bytes. `vault.note_title` and
+  `vault.extract_tags` — the one derivation shared by the indexer, `read_note`
+  metadata and `move_note` — remove it (a title that is nothing but NUL falls
+  back to the stem); `_jsonb_value` removes it from every string key and value
+  on its walk, keeping #154's first-key-wins rule for a key that collides after
+  removal. **The parsed mapping `read_note` returns and `set_frontmatter`
+  re-serialises is not touched**, so setting an unrelated key never rewrites
+  the escape. `extract_tags` also drops a tag over `MAX_TAG_BYTES` (1,024
+  UTF-8 bytes): `tags` has a GIN index and a key over ~2.7 KB raises 54000,
+  which would cost the whole note for one tag. The shared helper reports the
+  dropped sizes through its `dropped=` list and never logs itself (it is on
+  `read_note`'s request path, where #190 forbids a caller-drivable bare
+  WARNING); the indexer passes the list and logs one WARNING per note naming
+  the path and the sizes, never the tag.
+- **A NUL-bearing link is not a link** (D2). Markdown hrefs are
+  percent-decoded, so `[x](bad%00target.md)` yields U+0000 from NUL-free text;
+  removing it would invent a link to `badtarget.md`, a different file. The
+  extractor drops a markdown link whose decoded target (or raw label) contains
+  NUL, and a wikilink/embed with a NUL anywhere in target, anchor or alias.
+  The markdown `#anchor` is never decoded or stored apart from `link_text`
+  (where `%00` stays three characters), so it is deliberately not examined:
+  dropping `[x](a.md#%00)` would change storable rows and need an extraction
+  version bump. No row that could exist today changes, so there is no bump.
+- **Paths and contents the index can never hold are present but not
+  indexable, decided at the scan** (D7). A filename that is not valid UTF-8
+  (`os.scandir` hands back a surrogate-escaped `str`, which asyncpg refuses at
+  the first bind — the move UPDATE or the batch upsert — exactly the #308
+  wedge), a path longer than `file_path` (`MAX_PATH_CHARS`, 1,024 — 22001 at
+  the same sites), and a file whose bytes were read in full but are not valid
+  UTF-8. `_scan_vault` checks `is_encodable(rel)` and the length before it
+  stats or reads, and classifies a `UnicodeDecodeError` the same way; the C4
+  locked re-read re-reads a content-classified path whose row moved under the
+  walk and applies the same rule, as does the raw-body fallback. Such a path
+  is kept in `seen` (so it is not "vanished"), excluded from `to_upsert` and
+  from move pairing (added to the prune set *after* move detection), and any
+  row at it is deleted through the ordinary prune — embeddings and outgoing
+  links cascade, inbound links fall back to dangling. One WARNING per path per
+  pass, rendered with `backslashreplace` (`_loggable_path`) so the line can
+  always be written. **It is not a skip**: it withholds neither a re-derive's
+  stamp (its row is gone, so nothing foreign survives at it) nor the
+  backstop's clock. Before this a Latin-1 rewrite of an indexed note left its
+  row in place — the path was `seen`, so neither upserted nor pruned — and
+  `semantic_search` served the old content as current. **A file that cannot be
+  read (EACCES, EIO, ENOENT, a dangling symlink) is deliberately not in this
+  class**: its row may be the correct row for a file merely unreadable at that
+  moment, so it is kept. A decode failure differs because the bytes *were*
+  read and provably are not the bytes the row was derived from.
+- **A skip withholds the re-derive stamp only if it could hide a row** (D8).
+  The completeness rule (A.7a) exists so a skipped path cannot leave the
+  previous vault's row certified under the new root; a skip can do that only
+  if a row exists at that path. So `withholding` — not `skips` — decides:
+  a read, C4 re-read, raw-body or parse skip on a path with a row in the
+  **locked** rows; any directory the walk could not list (anything beneath
+  could have a row); a C5 deferral (it has a row by construction); and the
+  keyword-vector and link-rebuild skips (paths already in `to_upsert`). A read
+  skip on a row-less path, and every D7 path, do not withhold. The old
+  rationale for withholding on *any* skip — "a re-derive parses and upserts a
+  vault the pass already reads in full" — stopped being true with the stat
+  shortcut (#282): a re-derive forces every file into `to_upsert` with a
+  keyword-vector UPDATE and a link rebuild, so one never-indexed unreadable
+  file made a **full-scope rewrite every tick, for ever**, #308's write
+  amplification by a route the spec accepted. All skips are still logged; the
+  withholding ones are named as the offenders. The pass reports what happened
+  on its return value: `index_vault` returns an `IndexPassResult` — still the
+  `(notes_scanned, notes_indexed)` two-tuple every caller unpacks — whose
+  `rederive` is `None` (not a re-derive), `"recorded"`, `"incomplete"` (a
+  withholding skip; `rederive_incomplete` is True) or `"unrecorded"` (nothing
+  withheld it but the NOWAIT stamp lost a lock or the assignment moved), and
+  whose `not_indexable` counts D7 paths. Failure accounting counts an
+  incomplete re-derive toward the scope's degradation; `"unrecorded"` counts
+  the same way (its consequence is the same full-scope re-derive next tick),
+  so only a lock or assignment race that persists for
+  `INDEXER_DEGRADED_AFTER_FAILURES` passes reaches degraded.
+
+### The poison-note quarantine (#308, D3, D5)
+
+D1/D2/D7 close the routes known today; the quarantine bounds the class, so the
+next unforeseen value costs one note rather than its owner's whole index.
+
+- **A poison failure** is a database error whose SQLSTATE is class 22 (data
+  exception) or 54000 (program limit exceeded) — `poison_sqlstate`, which
+  reads the first SQLSTATE on the SQLAlchemy wrapper / driver chain — raised
+  in an **incremental** pass by a write attributable to one note: the
+  id-preserving **move** UPDATE (with its `target_path` rewrite), its row of
+  the **batch upsert**, its **keyword vector** at the floor, or its **link**
+  inserts. asyncpg's client-side refusal of an unencodable bind (a lone
+  surrogate) surfaces as `asyncpg.exceptions.DataError` with sqlstate
+  `22000`, so it is in the set without a special case. (The routes a YAML
+  `"\ud800"` has to those writes — title, tags, JSONB values — are already
+  closed by `coerce_text` and the frontmatter scrub; the quarantine is the
+  backstop.)
+- **Each site runs in a savepoint**, `try` outside `begin_nested()`
+  (`_savepoint_poison`). A batch upsert statement that fails with a poison
+  SQLSTATE is **replayed one row at a time**, each row in its own savepoint,
+  and **every** row that fails alone is named; if none does, the original
+  error is re-raised — a statement-level failure is not attributable to a
+  note. The tsvector and link sites carry on past a poison note so the stage
+  names all of them; the move site does the same per move.
+- **Restart, not repair-in-place.** The stage raises `PoisonNote`; the
+  attempt's whole transaction rolls back; the notes are quarantined; and
+  `_index_vault_pinned` re-runs `_index_vault_attempt` — from the generation
+  lock and classification, moves included — against fresh copies of the
+  scan's verdicts. The walk is not repeated. Repairing in place would leave
+  `moved_new_paths` and the `to_upsert` exclusions describing undone writes.
+  At most `INDEXER_QUARANTINE_RETRIES_PER_TICK` (5) restarts per scope per
+  invocation; beyond it `QuarantineRetriesExhausted` fails the pass as an
+  ordinary failure (counted by `indexer_health`), and the notes found so far
+  stay quarantined for the next tick. It lives in `index_vault`, so the
+  startup pass, the periodic pass and the panel's Reindex now all get it.
+- **A quarantined note is absent, never stale.** The registry is in-process,
+  `(owner, rel_path) → (content_hash, sqlstate, at)`. After the C4 re-read, a
+  file whose current hash equals its quarantined hash is moved from `files`
+  to `not_indexable` — the D7 mechanism: not upserted, never a move source or
+  destination, and any row at it deleted through the ordinary prune with its
+  embeddings and outgoing links. Keeping the old row would let
+  `semantic_search` serve superseded content as current (it only compares
+  `embedded_content_hash` with `content_hash`). A moved note whose move fails
+  loses its source row as a vanished file.
+- **A quarantine is not a read failure.** The bytes were read and hashed and
+  the row is absent by decision, so it neither withholds a re-derive's stamp
+  (no row survives at the path to be foreign) nor keeps the scope due for a
+  full-hash pass. Without both, one quarantined note would re-arm a
+  whole-scope rewrite every tick — #308 by another route.
+- **Cleared** when the note next indexes (its content changed and no longer
+  fails), when its file is gone from the walk, when the scope is discarded on
+  reassignment, or when a user leaves the active set; not persisted, so a
+  restart re-learns each poison note for one rolled-back attempt.
+- **Visible where the operator looks** (D5): one ERROR per quarantine (path via
+  `backslashreplace`, SQLSTATE, never content or the driver's message), the
+  pass's `indexer_runs.error` reads `quarantined N note(s): <path>, …` (at
+  most five, then `…`), and `/health` counts them as `quarantined_notes`
+  (`degraded`, no paths). **A quarantining pass is a successful pass**:
+  nothing derives success from the `error` column.
 
 ## Non-finite frontmatter numbers, and the one title rule (#154)
 
@@ -1530,13 +1707,13 @@ pass:    pg_advisory_xact_lock at the write  -> waits on the rebuild's advisory
 
 — a cycle the database resolves by killing one side. So the pass calls
 `acquire_generation_lock_unbounded(session)` and `_assert_fts_generation_current(session)`
-at the **head of `_index_vault_pinned`'s transaction** — ahead of every lock it
+at the **head of `_index_vault_attempt`'s transaction** (one per attempt, #308 D3) — ahead of every lock it
 takes, with only that helper's own `SET LOCAL statement_timeout` before it — and
 anyone adding a mutation to that function must keep it below that line: the
 requirement is to audit what the transaction touches, not to reason backwards
 from the write that consumes the fingerprint. A mismatch raises
-`GenerationMismatch` and the pass commits nothing, exactly as a tsvector floor
-failure already does, and retries next tick under whichever configuration is
+`GenerationMismatch` and the pass commits nothing, exactly as a non-poison floor
+tsvector failure does, and retries next tick under whichever configuration is
 then current. The abort is deliberately fatal to the pass rather than a skip: a
 keyword vector is only ever rewritten when a note's `content_hash` changes, so
 a row written under the previous `FTS_CONFIGS` would keep that vector for ever

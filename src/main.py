@@ -46,6 +46,7 @@ from src.services.rate_limits import flush_all
 from src.services import concurrency
 from src.services import concurrency_counters
 from src.services import vault_fs
+from src.services import indexer_health
 from src.logging_setup import configure_logging
 from src.transfer.routes import router as transfer_router
 
@@ -403,9 +404,18 @@ async def _warm_embedding_model() -> None:
 
 
 def _on_indexer_done(task: asyncio.Task) -> None:
+    """Record the indexer task's end for `/health` (#308, D4).
+
+    Cancellation is the lifespan shutting down and is not a failure. Anything
+    else — an exception, or a return from a loop that should run forever — is
+    recorded as "task not running", which `/health` reports as `degraded`:
+    before this, a dead indexer left the server serving stale search with a
+    `status: ok` health check and one CRITICAL log line as the only signal.
+    """
     if task.cancelled():
         logging.getLogger(__name__).info("Indexer task cancelled (lifespan shutdown)")
         return
+    indexer_health.mark_task_stopped()
     exc = task.exception()
     if exc is not None:
         logging.getLogger(__name__).critical(
@@ -500,6 +510,9 @@ async def lifespan(app: FastAPI):
                 "MCP_SANDBOX_MODE active — skipping DB check and indexer. "
                 "Tools are registered but cannot run. Registry-eval only."
             )
+            # No indexer runs here by design: `/health` says `disabled`, which
+            # does not by itself make the top-level status `degraded`.
+            indexer_health.mark_disabled()
             # Sandbox mode still has to be *ready*: the admission gate refuses
             # every multi-user caller until a snapshot is published, and a
             # sandbox that never publishes one would refuse every registered
@@ -797,10 +810,28 @@ async def health():
     file in the vault — nor may it be the thing that decides a root's staging
     mode. The mount-identity probe is read-only, but it belongs to startup: a
     health check must not be where a capability verdict is made either.
+
+    `indexer` (#308, D4) is the indexer's failure accounting, read from
+    in-process state (`src/services/indexer_health.py`): `status`
+    (`ok` | `degraded` | `disabled`), `task_running`, `failing_scopes`,
+    `embedding_failing_scopes`, `max_consecutive_failures`,
+    `quarantined_notes` and `last_success_at`. When it is `degraded` — the
+    indexer task is dead, any index / embedding / incomplete-re-derive /
+    enumeration counter has reached `INDEXER_DEGRADED_AFTER_FAILURES`, or a
+    note is quarantined — the top-level `status` is `degraded` too.
+    `disabled` (`MCP_SANDBOX_MODE`) does not by itself degrade the top level.
+
+    **The HTTP status is 200 in every case.** Kubernetes uses this endpoint
+    for liveness, and a restart loop cannot repair vault content or an
+    embedding-provider outage; monitors alert on the `status` field instead.
+    **Counts only**: no path, error text, SQLSTATE or user id — the endpoint
+    is unauthenticated and publicly routed.
     """
+    indexer = indexer_health.snapshot()
     return JSONResponse(
         {
-            "status": "ok",
+            "status": "degraded" if indexer["status"] == "degraded" else "ok",
+            "indexer": indexer,
             "vault_named_staging_fallback_active": (
                 vault_fs.named_staging_fallback_active()
             ),

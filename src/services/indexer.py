@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import ctypes
+import dataclasses
 import enum
 import errno
 import fnmatch
@@ -52,6 +53,7 @@ from src.services.embeddings import (
     embed_note,
 )
 from src.services.fts import index_tsvector_sql
+from src.services import indexer_health
 from src.services.rate_limits import flush_expired
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
@@ -76,9 +78,12 @@ from src.oauth.grants import lock_account_guard
 from src.services import vault_overlap
 from src.services.transfer import canonical_vault_root
 from src.services.vault import (
+    MAX_PATH_CHARS,
+    MAX_TAG_BYTES,
     _vault_root,
     canonical_key,
     extract_tags,
+    is_encodable,
     non_finite_token,
     note_title,
     parse_frontmatter,
@@ -276,6 +281,12 @@ class PassStats:
         scanned, indexed = result
         self.notes_scanned += int(scanned)
         self.notes_indexed += int(indexed)
+        # #308 D5: a pass that excluded quarantined notes names them where
+        # the operator already looks. Text in `error` only — the pass is not
+        # a failure, and nothing derives success from this column.
+        quarantined = getattr(result, "quarantined", ())
+        if quarantined:
+            self.errors.append(format_quarantined(quarantined))
 
     def record_embedded(self, result) -> None:
         """Absorb `embed_vault`'s count of notes it actually embedded.
@@ -480,7 +491,7 @@ class VaultRootQuarantined(RuntimeError):
     """
 
 
-async def detect_root_overlaps(where: str) -> None:
+async def detect_root_overlaps(where: str) -> bool:
     """Publish a quarantine snapshot before this entry point begins a pass.
 
     **Called before `index_pass_lock` is taken**, deliberately: the check must
@@ -496,6 +507,9 @@ async def detect_root_overlaps(where: str) -> None:
     still stands (retained, never cleared) or nothing has been published and
     `_refuse_quarantined_pass` refuses every multi-user stage until some later
     entry point publishes one.
+
+    Returns whether detection succeeded, so the indexer loop can count a
+    failure toward its tick-level (enumeration) counter (#308, D4).
     """
     try:
         await vault_overlap.detect_and_publish()
@@ -506,6 +520,8 @@ async def detect_root_overlaps(where: str) -> None:
             where,
             e,
         )
+        return False
+    return True
 
 
 def _refuse_quarantined_pass(user_id: int | None, stage: str) -> None:
@@ -631,24 +647,33 @@ def _jsonb_value(v):
     which to report the loss and must never fail the pass, so a deterministic,
     documented winner is the whole available remedy. The read view, which
     *can* report a loss, omits the view whole instead (design D10, L14).
+
+    **U+0000 is removed from every string key and value** (#308, D2): YAML's
+    `"\\0"` escape produces one from NUL-free bytes, and `jsonb` rejects it
+    (`\\u0000 cannot be converted to text`). Removed on this walk, at the
+    same boundary, and a key that collides after removal follows the same
+    first-key-wins rule. A non-string value that is stringified below (a date)
+    cannot contain NUL.
     """
     token = non_finite_token(v)
     if token is not None:
         return token
-    if isinstance(v, (str, int, float, bool, type(None))):
+    if isinstance(v, str):
+        return v.replace("\x00", "")
+    if isinstance(v, (int, float, bool, type(None))):
         return v
     elif isinstance(v, list):
         return [_jsonb_value(i) for i in v]
     elif isinstance(v, dict):
         out: dict = {}
         for k, val in v.items():
-            rendered = canonical_key(k)
+            rendered = canonical_key(k).replace("\x00", "")
             if rendered in out:
                 continue  # first key wins, stated rather than inherited
             out[rendered] = _jsonb_value(val)
         return out
     else:
-        return str(v)
+        return str(v).replace("\x00", "")
 
 
 def _sanitize_frontmatter(fm: dict) -> dict:
@@ -760,7 +785,8 @@ TSVECTOR_CONTENT_FLOOR_CHARS = 100_000
 
 
 async def write_tsvector_bounded(
-    session, statement, content: str, params: dict, *, label: str
+    session, statement, content: str, params: dict, *, label: str,
+    quiet_poison_floor: bool = False,
 ) -> int:
     """Run one `content_tsvector` UPDATE, retreating on failure. Returns the
     prefix length that succeeded.
@@ -783,10 +809,12 @@ async def write_tsvector_bounded(
     note would never be selected again and `keyword_search` would answer from
     content it no longer has.
 
-    The two call sites carry different, individually stated guarantees: the
-    incremental pass commits nothing on a floor failure, so the note is retried
-    next tick; `_rebuild_tsvectors_single_scope_for_tests` is atomic, so a floor failure rolls the whole
-    rebuild back and surfaces to the operator who invoked it.
+    The two call sites carry different, individually stated guarantees: in the
+    incremental pass a floor failure with a poison SQLSTATE quarantines the
+    note and the pass is re-run without it (#308, D3), while any other floor
+    failure aborts the pass with nothing committed;
+    `_rebuild_tsvectors_single_scope_for_tests` is atomic, so a floor failure
+    rolls the whole rebuild back and surfaces to the operator who invoked it.
 
     Returns `(prefix_length, rowcount)`. **The rowcount is not something this
     helper acts on, deliberately.** `_rebuild_tsvectors_single_scope_for_tests` addresses its UPDATE by
@@ -806,6 +834,12 @@ async def write_tsvector_bounded(
         except Exception as exc:
             if length <= TSVECTOR_CONTENT_FLOOR_CHARS:
                 # The floor. Propagate exactly as the pre-change code did.
+                # `quiet_poison_floor` (the incremental pass): a poison floor
+                # failure goes to quarantine, whose own ERROR names the path
+                # and SQLSTATE; the driver's message is not logged, because
+                # a 22P02 DETAIL can quote the note's text (#308).
+                if quiet_poison_floor and poison_sqlstate(exc) is not None:
+                    raise
                 logger.exception(
                     "Failed to update the keyword vector for %s at %d "
                     "characters, at or below the %d-character floor; "
@@ -824,6 +858,263 @@ async def write_tsvector_bounded(
             )
             continue
         return length, rowcount
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Poison-note quarantine (#308, design D3)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# One index pass for one scope is one transaction, so a single note whose row
+# the database refuses used to roll back the owner's whole pass on every tick
+# (#126, #154, #308 — three routes to the same class). A **poison failure** is
+# a data-exception (SQLSTATE class 22) or program-limit (54000) error raised by
+# a write attributable to exactly one note: its id-preserving move, its row in
+# the batch upsert, its keyword vector at the floor, or its link inserts. Each
+# such site runs in a savepoint; a batch is replayed one row at a time to find
+# the note(s); the pass then raises `PoisonNote`, the transaction rolls back
+# in full, the note is quarantined and the pass re-runs from classification
+# without it — bounded by `INDEXER_QUARANTINE_RETRIES_PER_TICK`.
+#
+# A quarantined note is **absent** from the index, never kept stale: while its
+# file still hashes to the quarantined hash it is "present but not indexable"
+# exactly like a D7 path, so any row at it is deleted through the ordinary
+# delete path. It is not a read failure: it neither withholds a re-derive's
+# stamp nor keeps the scope due for a full-hash pass. The registry is
+# in-process; a restart re-learns each poison note at the cost of one
+# rolled-back attempt. The full keyword rebuild is excluded and stays atomic.
+
+#: SQLSTATE class 22 is "data exception"; 54000 is "program limit exceeded".
+POISON_SQLSTATE_CLASS = "22"
+POISON_SQLSTATES = frozenset({"54000"})
+#: Not-indexable reason recorded for a path whose current hash is quarantined.
+QUARANTINED = "quarantined after a poison database failure"
+#: How many quarantined paths a run record names before an ellipsis (D5).
+QUARANTINE_REPORT_LIMIT = 5
+
+
+def _is_connection_failure(e: BaseException) -> bool:
+    """A connection, interface or session-state failure: never poison, whatever
+    it wraps (C4). Judged only on an exception that carries no SQLSTATE of its
+    own — one that does is decided by that SQLSTATE."""
+    import asyncpg.exceptions as _apg
+    import sqlalchemy.exc as _sa_exc
+
+    if isinstance(e, (OSError, ConnectionError, _apg.InterfaceError,
+                      _apg.PostgresConnectionError,
+                      _sa_exc.InvalidRequestError)):
+        # InvalidRequestError covers PendingRollbackError and
+        # ResourceClosedError: session/transaction state, never note data.
+        return True
+    if isinstance(e, _sa_exc.DBAPIError) and e.connection_invalidated:
+        return True
+    # A DB-API `InterfaceError` of any driver (SQLAlchemy's asyncpg adapter
+    # included) is by definition a failure of the interface, not of data.
+    return type(e).__name__ == "InterfaceError" and not isinstance(
+        e, _sa_exc.DBAPIError
+    )
+
+
+def poison_sqlstate(exc: BaseException) -> str | None:
+    """The poison SQLSTATE behind `exc`, or None if it is not a poison failure.
+
+    Inspects the exception itself, the SQLAlchemy wrapper's driver exception
+    (`DBAPIError.orig`) and the explicit `__cause__` chain — **never**
+    `__context__` (C4): an exception raised while another was being handled,
+    such as a savepoint rollback that failed on a dead connection after a
+    poison statement, must not inherit that statement's classification. The
+    **first** SQLSTATE found decides — a wrapper that says serialization
+    failure is not reclassified by something deeper — and a connection,
+    interface or session-state failure without a SQLSTATE of its own
+    (`InterfaceError`, `PendingRollbackError`, a connection error, an
+    `OSError`) is not poison whatever it wraps. asyncpg's *client-side* bind
+    failure (a lone surrogate the server would never see) surfaces as
+    `asyncpg.exceptions.DataError` with `sqlstate == "22000"`, so it is class
+    22 like the server-side ones; a bare `UnicodeEncodeError` in the cause
+    chain with no SQLSTATE anywhere (another driver) is treated the same, as
+    `22021`.
+    """
+    seen: set[int] = set()
+    queue: list[BaseException | None] = [exc]
+    encode_error = False
+    while queue:
+        e = queue.pop(0)
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        if isinstance(e, UnicodeEncodeError):
+            encode_error = True
+        for attr in ("sqlstate", "pgcode"):
+            code = getattr(e, attr, None)
+            if isinstance(code, str) and len(code) == 5:
+                if code.startswith(POISON_SQLSTATE_CLASS) or code in POISON_SQLSTATES:
+                    return code
+                return None
+        if _is_connection_failure(e):
+            return None
+        queue.extend([getattr(e, "orig", None), e.__cause__])
+    return "22021" if encode_error else None
+
+
+@dataclass(frozen=True)
+class QuarantineEntry:
+    content_hash: str
+    sqlstate: str
+    at: datetime
+
+
+@dataclass(frozen=True)
+class PoisonCandidate:
+    """One note a write site identified as failing alone."""
+
+    rel_path: str
+    content_hash: str
+    sqlstate: str
+    site: str
+
+
+class PoisonNote(RuntimeError):
+    """Raised inside an index attempt once a write site identified poison
+    note(s). Internal: the attempt's transaction rolls back, the notes are
+    quarantined and the pass re-runs. Never escapes `index_vault`."""
+
+    def __init__(self, notes: list[PoisonCandidate]):
+        self.notes = list(notes)
+        super().__init__(
+            f"{len(self.notes)} poison note(s) at "
+            + ", ".join(sorted({n.site for n in self.notes}))
+        )
+
+
+class QuarantineRetriesExhausted(RuntimeError):
+    """A scope needed more quarantine restarts than one invocation allows."""
+
+
+#: `(owner, rel_path) -> QuarantineEntry`. In-process by design.
+_quarantine: dict[tuple[int | None, str], QuarantineEntry] = {}
+
+
+def quarantine_count() -> int:
+    """Quarantined notes across every scope — `/health`'s count."""
+    return len(_quarantine)
+
+
+def quarantined_paths(owner: int | None) -> list[str]:
+    return sorted(rel for (o, rel) in _quarantine if o == owner)
+
+
+def _quarantined_hash(owner: int | None, rel: str) -> str | None:
+    entry = _quarantine.get((owner, rel))
+    return entry.content_hash if entry is not None else None
+
+
+def _quarantine_note(owner: int | None, note: PoisonCandidate) -> None:
+    _quarantine[(owner, note.rel_path)] = QuarantineEntry(
+        content_hash=note.content_hash,
+        sqlstate=note.sqlstate,
+        at=datetime.now(timezone.utc),
+    )
+    # Path and SQLSTATE only — never content, never the driver's message,
+    # which can quote the offending value.
+    logger.error(
+        "Quarantined %s%s: its %s write failed with SQLSTATE %s. It is removed "
+        "from the index until its content changes; the file on disk is "
+        "unchanged.",
+        _loggable_path(note.rel_path),
+        f" (user_id={owner})" if owner is not None else "",
+        note.site,
+        note.sqlstate,
+    )
+
+
+def clear_quarantine(owner: int | None = ..., rel: str | None = None) -> None:  # type: ignore[assignment]
+    """Forget quarantine entries: all, one scope's, or one path's."""
+    if owner is ...:
+        _quarantine.clear()
+        return
+    for key in [k for k in _quarantine if k[0] == owner]:
+        if rel is None or key[1] == rel:
+            del _quarantine[key]
+
+
+def retain_quarantine_scopes(active) -> None:
+    """Forget per-user entries of users no longer active (multi-user mode)."""
+    keep = set(active)
+    for key in [k for k in _quarantine if k[0] is not None and k[0] not in keep]:
+        del _quarantine[key]
+
+
+def format_quarantined(paths) -> str:
+    """D5's run-record line: at most five paths, then `…`, each rendered so
+    an unencodable character can never make the record unstorable. Line
+    breaks in a path are escaped so the record stays one line, which is how
+    the panel tells a quarantining pass from a failed one
+    (`indexer_health.run_outcome`)."""
+    paths = list(paths)
+    shown = [
+        _loggable_path(p).replace("\n", "\\n").replace("\r", "\\r")
+        for p in paths[:QUARANTINE_REPORT_LIMIT]
+    ]
+    more = ", …" if len(paths) > QUARANTINE_REPORT_LIMIT else ""
+    return (
+        f"{indexer_health.QUARANTINED_RUN_PREFIX}{len(paths)} note(s): "
+        f"{', '.join(shown)}{more}"
+    )
+
+
+async def _savepoint_poison(session, run) -> BaseException | None:
+    """Run `await run()` in a savepoint. Returns the exception when it is a
+    poison failure **and** the savepoint rolled back cleanly (so the outer
+    transaction is usable); re-raises anything else; None on success.
+
+    The `try` is outside `begin_nested()` for the reason
+    `write_tsvector_bounded` gives. The body's own exception is captured
+    (and re-raised at once, so the context manager still rolls back): if what
+    leaves the `async with` is a *different* exception, the savepoint
+    rollback itself failed — the connection is gone or the transaction is
+    unusable — and that propagates, never returned as a recoverable poison
+    failure, whatever poison statement preceded it (C4).
+    """
+    body_exc: BaseException | None = None
+    try:
+        async with session.begin_nested():
+            try:
+                await run()
+            except Exception as e:
+                body_exc = e
+                raise
+    except Exception as exc:
+        if exc is not body_exc or poison_sqlstate(exc) is None:
+            raise
+        return exc
+    return None
+
+
+async def _confirm_poison(session, run, first: BaseException, *, site: str) -> str:
+    """Re-execute one note's write once more, in a fresh savepoint, before it
+    is treated as poison (C8). Returns the confirming poison SQLSTATE.
+
+    A failure that does not reproduce was not caused by the note's data — a
+    transient server condition, a one-off trigger, a concurrent change — so
+    nothing is quarantined: the original error is re-raised and the pass fails
+    as an ordinary failure, retried on the next tick. A retry that fails with
+    a non-poison error propagates that error the same way.
+    """
+    again = await _savepoint_poison(session, run)
+    if again is None:
+        # SQLSTATE only: the driver message can quote the note's content.
+        logger.error(
+            "A %s write failed with SQLSTATE %s but succeeded when retried "
+            "alone; the failure is not attributable to the note, so nothing "
+            "is quarantined and this pass fails, to be retried on the next "
+            "tick.",
+            site,
+            poison_sqlstate(first),
+        )
+        raise first
+    return poison_sqlstate(again)
+
+
+indexer_health.set_quarantine_count_provider(quarantine_count)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1393,7 +1684,64 @@ def _format_skips(skips: list[str]) -> str:
         if len(skips) > len(shown)
         else ""
     )
-    return ", ".join(shown) + suffix
+    return ", ".join(_loggable_path(s) for s in shown) + suffix
+
+
+def _loggable_path(rel: str) -> str:
+    """`rel` rendered so it can always be logged and stored (#308, D7).
+
+    A filename that is not valid UTF-8 reaches Python as a surrogate-escaped
+    `str` (`caf\\udce9.md`), which no UTF-8 sink can encode. `backslashreplace`
+    renders each such code point as its escape, so the log line names the file
+    without raising.
+    """
+    return rel.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Present but not indexable (#308, design D7)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Three inputs can never be held by the index, whatever the pass does: a
+# vault-relative path that is not encodable as UTF-8 (a Latin-1 byte in a
+# filename, surrogate-escaped by `os.scandir`), a path longer than
+# `notes_metadata.file_path` (`MAX_PATH_CHARS`), and a file whose bytes were
+# read in full but are not valid UTF-8. The first two used to fail at the
+# first bind — the move UPDATE or the batch upsert — and roll the owner's
+# whole pass back every tick, exactly like #308. The third left the row in
+# place (the path was `seen`, so neither upserted nor pruned), and search went
+# on serving content the file no longer holds.
+#
+# All three are decided at the scan, before any write, and the C4 locked
+# re-read applies the same test. Such a path is excluded from the upsert and
+# from move pairing, and any row at it is deleted in the pass's transaction
+# through the ordinary delete (embeddings and outgoing links cascade). It is
+# NOT a skip: it does not withhold a re-derive's stamp (its row is deleted, so
+# nothing foreign survives at it) and it does not keep the scope due for a
+# full-hash pass. A file that cannot be *read* (EACCES, EIO, ENOENT) is not in
+# this class: its row may be right for a file merely unreadable now, so it is
+# kept.
+
+#: The reason `_scan_vault` records for bytes that are not valid UTF-8.
+NOT_UTF8_CONTENT = "content is not valid UTF-8"
+
+
+def _path_not_indexable_reason(rel: str) -> str | None:
+    """Why `rel` itself can never be a `file_path`, or None if it can."""
+    if not is_encodable(rel):
+        return "path is not valid UTF-8"
+    if len(rel) > MAX_PATH_CHARS:
+        return f"path is {len(rel):,} characters, over {MAX_PATH_CHARS:,}"
+    return None
+
+
+def _warn_not_indexable(rel: str, reason: str) -> None:
+    logger.warning(
+        "Not indexing %s: %s. Any index row at this path is removed; the file "
+        "on disk is unchanged",
+        _loggable_path(rel),
+        reason,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1524,8 +1872,23 @@ def discover_markdown_files(vault: Path) -> dict[str, Path]:
         }
 
 
-def read_note_at(parent_fd: int, name: str) -> tuple[str, os.stat_result]:
+def read_note_at(
+    parent_fd: int, name: str, rel: str | None = None
+) -> tuple[str, os.stat_result]:
     """`(text, stat)` for one note, both from **one** open descriptor.
+
+    **The returned text has every U+0000 removed** (#308, design D1). This is
+    the indexer's single decode point — the scan, the C4 re-read, the embed
+    backlog, reconciliation, the link backfill and the tsvector rebuild all
+    read through it — so the content hash and every derived column (keyword
+    vector, title, tags, links, chunk text) describe the same NUL-free text,
+    and no re-verifier can disagree with the scan about a hash. PostgreSQL
+    `text` cannot hold 0x00: one NUL used to fail the keyword-vector UPDATE and
+    roll the owner's whole pass back, every tick. A note without a NUL is
+    returned unchanged, so its hash is unchanged. The file on disk is never
+    modified. One WARNING per read that removed anything names `rel` (the
+    vault-relative path; `name` when the caller has none) and the count —
+    never content.
 
     Deliberately **no** `O_NOFOLLOW` on the leaf: a symlinked `.md` is read
     today and this change must not alter what the index contains. Containment
@@ -1545,9 +1908,19 @@ def read_note_at(parent_fd: int, name: str) -> tuple[str, os.stat_result]:
     try:
         stat = os.fstat(fd)
         with open(fd, "r", encoding="utf-8", errors="strict", closefd=False) as handle:
-            return handle.read(), stat
+            text_ = handle.read()
     finally:
         os.close(fd)
+    nul = text_.count("\x00")
+    if nul:
+        logger.warning(
+            "Removed %d NUL character(s) from %s before indexing; the file on "
+            "disk is unchanged",
+            nul,
+            _loggable_path(rel if rel is not None else name),
+        )
+        text_ = text_.replace("\x00", "")
+    return text_, stat
 
 
 def open_beneath(root_fd: int, rel_path: str) -> tuple[int, str]:
@@ -1581,7 +1954,7 @@ def read_note_beneath(root_fd: int, rel_path: str) -> tuple[str, os.stat_result]
     """`read_note_at` for a path the caller names rather than one it walked."""
     parent_fd, name = open_beneath(root_fd, rel_path)
     try:
-        return read_note_at(parent_fd, name)
+        return read_note_at(parent_fd, name, rel=rel_path)
     finally:
         os.close(parent_fd)
 
@@ -1709,13 +2082,19 @@ class ScanResult:
     skips: list[str] = field(default_factory=list)
     #: The subset of `skips` whose bytes were **not obtained**: a directory the
     #: walk could not list, a file whose read raised. These block the
-    #: backstop's clock (D12). A file that was read in full but is not valid
-    #: UTF-8 is in `skips` and not here: its bytes were obtained, it is never
-    #: indexed from them, and re-reading it every tick could not change that
-    #: outcome (a row left from when it still decoded is kept, not pruned, as
-    #: before this change; its stat no longer matches, so every pass re-reads
-    #: it and logs the skip).
+    #: backstop's clock (D12).
     unverified: list[str] = field(default_factory=list)
+    #: Directories the walk could not open or list, as skip entries. Each
+    #: withholds a re-derive's stamp unconditionally: anything beneath it could
+    #: have a row (#308, D8).
+    walk_failures: list[str] = field(default_factory=list)
+    #: `(rel, skip entry)` for each file whose read raised. It withholds a
+    #: re-derive's stamp only if the **locked** rows have that path — decided
+    #: under the lock, not here (D8).
+    read_failures: list[tuple[str, str]] = field(default_factory=list)
+    #: Present on disk, not indexable: `rel -> reason` (D7). Not in `skips`, not
+    #: in `unverified`, not in `files`; any row at the path is deleted.
+    not_indexable: dict[str, str] = field(default_factory=dict)
     reads: int = 0
     shortcut: int = 0
 
@@ -1735,7 +2114,7 @@ def _read_and_hash(
     thread and, for re-processed paths, through `to_thread` under the lock.
     """
     t_start = _wall_clock_ns()
-    raw, st = read_note_at(parent_fd, name)
+    raw, st = read_note_at(parent_fd, name, rel=rel)
     return raw, _content_hash(raw), st, _recordable_stat(st, t_start)
 
 
@@ -1786,6 +2165,14 @@ def _scan_vault(
                 raise ScanCancelled("the index pass was cancelled mid-walk")
             rel = found.rel
             result.seen.add(rel)
+            # D7: a path the index can never hold is decided before the stat
+            # or the read — no row can exist at it, and it must never reach a
+            # bind parameter.
+            reason = _path_not_indexable_reason(rel)
+            if reason is not None:
+                _warn_not_indexable(rel, reason)
+                result.not_indexable[rel] = reason
+                continue
             row = snapshot.get(rel)
             if (
                 not force_read
@@ -1810,16 +2197,20 @@ def _scan_vault(
             try:
                 raw, h, st, recorded = _read_and_hash(found.parent_fd, found.name, rel)
             except UnicodeDecodeError:
-                # Bytes read in full; decoded-content-only. A skip (A.7a), not
-                # unverified (D12).
-                logger.warning(f"Skipping non-UTF8 file: {rel}")
-                result.skips.append(f"{rel} (not valid UTF-8)")
+                # Bytes read in full and provably not the bytes any row was
+                # derived from: present but not indexable (D7). Not a skip,
+                # not unverified; its row, if any, is deleted under the lock.
+                _warn_not_indexable(rel, NOT_UTF8_CONTENT)
+                result.not_indexable[rel] = NOT_UTF8_CONTENT
                 continue
             except Exception as e:
-                # Bytes not obtained: unverified, blocks the backstop's clock.
+                # Bytes not obtained: unverified, blocks the backstop's clock,
+                # and keeps any row at the path (D7 does not apply).
                 logger.warning(f"Failed to read {rel}: {e}")
-                result.skips.append(f"{rel} ({e})")
-                result.unverified.append(f"{rel} ({e})")
+                entry = f"{rel} ({e})"
+                result.skips.append(entry)
+                result.unverified.append(entry)
+                result.read_failures.append((rel, entry))
                 continue
             result.reads += 1
             result.files[rel] = ScannedFile(
@@ -1834,6 +2225,7 @@ def _scan_vault(
             )
     result.skips.extend(walk_failures)
     result.unverified.extend(walk_failures)
+    result.walk_failures.extend(walk_failures)
     return result
 
 
@@ -1899,9 +2291,9 @@ async def _run_scan(
 # first embed pass after a start a sweeping one.
 
 #: Monotonic time of each scope's last **successful** full-hash pass: one that
-#: committed having read and hashed every discovered file (non-UTF-8 files do
-#: not block; see `_index_vault_pinned`). Absent means due; a forced pass
-#: removes the entry before it starts.
+#: committed having read and hashed every discovered file (present-but-not-
+#: indexable paths do not block; see `_index_vault_pinned`). Absent means due;
+#: a forced pass removes the entry before it starts.
 _last_full_hash: dict[int | None, float] = {}
 
 #: Each scope's exclusion-pattern fingerprint as of its last **clean** sweep.
@@ -2024,6 +2416,9 @@ async def _reconcile_provenance(
                     "and no provenance was recorded."
                 )
             await session.commit()
+        # The scope's index is discarded, so are its quarantine entries (D3):
+        # they named content under the previous assignment.
+        clear_quarantine(user_id)
         logger.warning(
             "Vault reassignment detected%s: %s. Discarded %s notes_metadata "
             "row(s) (embeddings and links cascade). Was [%s]; now recorded "
@@ -2045,6 +2440,69 @@ async def _reconcile_provenance(
         classification.reason,
     )
     return True, facts
+
+
+#: What a committed re-derive established about its provenance stamp (#308,
+#: D8). `IndexPassResult.rederive` is None when the pass was not a re-derive.
+REDERIVE_RECORDED = "recorded"
+#: Withheld by a skip that could hide a row (D8); the next pass re-derives
+#: again, rewriting the whole scope. The signal failure accounting counts.
+REDERIVE_INCOMPLETE = "incomplete"
+#: Nothing withheld it, but the stamp itself was refused (lock unavailable, or
+#: the assignment moved); the next pass re-derives again.
+REDERIVE_UNRECORDED = "unrecorded"
+
+
+class IndexPassResult(tuple):
+    """`index_vault`'s `(notes_scanned, notes_indexed)`, plus what the pass
+    knows that a count cannot say.
+
+    Still a two-tuple, so every caller that unpacks it — `PassStats.
+    record_index`, the panel — is unchanged. The extra facts are attributes:
+
+    - `rederive`: None (not a re-derive), `REDERIVE_RECORDED`,
+      `REDERIVE_INCOMPLETE` or `REDERIVE_UNRECORDED`. Only a pass that
+      *committed* returns at all, so this is a committed re-derive's outcome.
+    - `rederive_incomplete`: True exactly when a skip that could hide a row
+      withheld the stamp (D8) — the per-scope condition failure accounting
+      counts toward degradation.
+    - `not_indexable`: how many discovered paths were present but not
+      indexable (D7), quarantined paths not included.
+    - `quarantined`: the sorted paths this pass excluded because they are
+      quarantined (D3) — newly or from an earlier pass. The run record names
+      them (D5); they do not make the pass a failure.
+    """
+
+    rederive: str | None
+    not_indexable: int
+    quarantined: tuple[str, ...]
+
+    def __new__(
+        cls,
+        notes_scanned: int,
+        notes_indexed: int,
+        *,
+        rederive: str | None = None,
+        not_indexable: int = 0,
+        quarantined: tuple[str, ...] = (),
+    ):
+        obj = super().__new__(cls, (notes_scanned, notes_indexed))
+        obj.rederive = rederive
+        obj.not_indexable = not_indexable
+        obj.quarantined = tuple(quarantined)
+        return obj
+
+    @property
+    def notes_scanned(self) -> int:
+        return self[0]
+
+    @property
+    def notes_indexed(self) -> int:
+        return self[1]
+
+    @property
+    def rederive_incomplete(self) -> bool:
+        return self.rederive == REDERIVE_INCOMPLETE
 
 
 async def index_vault(user_id: int | None = None, *, full_hash: bool = False):
@@ -2072,10 +2530,11 @@ async def index_vault(user_id: int | None = None, *, full_hash: bool = False):
     it. A backstop pass also forgets the scope's clean-sweep record, so the
     embed pass that follows runs the exclusion sweep (D13).
 
-    Returns `(notes_scanned, notes_indexed)` for the pass recorder (#160):
-    every markdown file the walk discovered, and the subset whose row this pass
-    wrote — the upserts plus the moves it repaired in place. Callers that do
-    not record a run may ignore it.
+    Returns an `IndexPassResult` — the two-tuple `(notes_scanned,
+    notes_indexed)` for the pass recorder (#160): every markdown file the walk
+    discovered, and the subset whose row this pass wrote, the upserts plus the
+    moves it repaired in place — carrying `rederive` / `rederive_incomplete`
+    (#308, D8) as attributes. Callers that do not record a run may ignore it.
 
     Refuses outright for a user the published overlap snapshot names — see
     `_refuse_quarantined_pass`. Nothing is read, written, pruned or
@@ -2147,7 +2606,7 @@ async def _index_vault_pinned(
     log_suffix: str,
     *,
     backstop: bool = True,
-) -> tuple[int, int]:
+) -> "IndexPassResult":
     # C6: provenance is reconciled first, in its own committed session, and
     # decides `re_derive` before a single file is read.
     re_derive = False
@@ -2161,21 +2620,31 @@ async def _index_vault_pinned(
         # moved; nothing a previous sweep established about them stands.
         clear_sweep_state(user_id)
 
-    # Anything the pass discovered but could not fully process. **A non-empty
-    # list makes a re-derive incomplete and withholds the stamp** (A.7a): the
-    # re-derive's whole claim is that every surviving row was written by this
-    # pass from a file under the assigned root, and one skipped path falsifies
-    # it — the ordinary prune keeps a row whose relative path exists under the
-    # new root, which is exactly the row a re-derive exists to replace. The
-    # repairs are still performed; only the certification is withheld.
+    # Anything the pass discovered but could not fully process, for the log.
     #
-    # **It also withholds the backstop's clock** (D12), with one exception: a
-    # file whose bytes were read in full but are not valid UTF-8. The clock
-    # asks "was every discovered file's bytes read and hashed", and such a
-    # file's were; it is never indexed, so no row can go stale from it, and a
-    # full-hash pass every tick could not change that. Every other skip
-    # blocks the clock; each source is classified where it is appended, and
-    # the rule is applied after the commit (`unverified`, `blocking_skips`).
+    # **Only the subset in `withholding` makes a re-derive incomplete** (A.7a,
+    # narrowed by #308 D8): the re-derive's whole claim is that every
+    # surviving row was written by this pass from a file under the assigned
+    # root, and a skip falsifies it only if it can hide a row — the ordinary
+    # prune keeps a row whose relative path exists under the new root, which
+    # is exactly the row a re-derive exists to replace. So a skip withholds
+    # the stamp when the skipped path has a row in the **locked** rows, when
+    # a directory could not be listed (anything beneath it may have one), or
+    # when the path was already selected for upsert (the keyword-vector and
+    # link-rebuild skips, whose derived rows this pass did not write); a C5
+    # deferral always has a row. A read skip on a path with no row cannot
+    # certify a foreign row and does not withhold: before D8 it did, and since
+    # a re-derive rewrites every file each tick until it records, one
+    # row-less unreadable file meant a full-scope rewrite every tick for ever.
+    # A present-but-not-indexable path (D7) is not a skip at all — any row at
+    # it is deleted in this transaction. The repairs are always performed;
+    # only the certification is withheld.
+    #
+    # **Skips also withhold the backstop's clock** (D12): every skip here
+    # blocks it (walk and read failures via `unverified`, and everything
+    # appended after `downstream_skips_from`). A not-indexable path does not:
+    # its bytes were read (or it can never be read into the index), and a
+    # full-hash pass every tick could not change that outcome.
     #
     # **Carve-out: a note whose link extraction was truncated at
     # `MAX_LINKS_PER_NOTE` is NOT a skip** (#203, D4). The claim A.7a makes is
@@ -2189,6 +2658,7 @@ async def _index_vault_pinned(
     # the row, one ERROR line per capped note per pass, and `truncated: true`
     # from `get_links` — so it is visible without being fatal.
     skips: list[str] = []
+    withholding: list[str] = []
 
     # ── The snapshot S, in its own committed transaction (C2) ─────────────
     # A plain SELECT holds `AccessShareLock` until its transaction ends, so a
@@ -2213,14 +2683,86 @@ async def _index_vault_pinned(
     )
     skips.extend(scan.skips)
     # Backstop-blocking failures (D12). From the scan: walk failures and read
-    # errors (`ScanResult.unverified`); its non-UTF-8 skips are not in it.
+    # errors (`ScanResult.unverified`).
     unverified: list[str] = list(scan.unverified)
+    # D8: a directory the walk could not list withholds unconditionally.
+    withholding.extend(scan.walk_failures)
     seen = scan.seen
     logger.info(
         f"Found {len(seen)} markdown files{log_suffix}: {scan.reads} read, "
         f"{scan.shortcut} unchanged by stat"
     )
 
+    # ── The mutation phase, re-run on a poison note (#308, D3) ────────────
+    # Each attempt is one transaction from the generation lock to the commit.
+    # A `PoisonNote` rolls the whole attempt back (the session closes without
+    # committing), the identified notes are quarantined, and the next attempt
+    # starts again from classification — moves included — against fresh
+    # copies of the scan's verdicts, because an attempt mutates them. The walk
+    # is not repeated: the bytes it read are still the bytes in question.
+    retries = settings.indexer_quarantine_retries_per_tick
+    restarts = 0
+    while True:
+        attempt_scan = dataclasses.replace(
+            scan,
+            files=dict(scan.files),
+            not_indexable=dict(scan.not_indexable),
+        )
+        try:
+            return await _index_vault_attempt(
+                user_id, vault, root_fd, log_suffix,
+                backstop=backstop,
+                re_derive=re_derive,
+                facts=facts,
+                snapshot=snapshot,
+                scan=attempt_scan,
+                skips=list(skips),
+                withholding=list(withholding),
+                unverified=list(unverified),
+            )
+        except PoisonNote as poison:
+            for note in poison.notes:
+                _quarantine_note(user_id, note)
+            if restarts >= retries:
+                # The notes identified so far stay quarantined, so the next
+                # tick starts further along; this invocation fails as an
+                # ordinary failure and counts toward degradation (D4).
+                raise QuarantineRetriesExhausted(
+                    f"Index pass{log_suffix} still hit poison notes after "
+                    f"{restarts} quarantine restart(s) "
+                    f"(INDEXER_QUARANTINE_RETRIES_PER_TICK={retries}); "
+                    "nothing from its last attempt was committed."
+                ) from None
+            restarts += 1
+            logger.warning(
+                "Re-running the index pass%s without %d quarantined note(s) "
+                "(restart %d of at most %d)",
+                log_suffix,
+                len(poison.notes),
+                restarts,
+                retries,
+            )
+
+
+async def _index_vault_attempt(
+    user_id: int | None,
+    vault: Path,
+    root_fd: int,
+    log_suffix: str,
+    *,
+    backstop: bool,
+    re_derive: bool,
+    facts: "RootFacts | None",
+    snapshot: dict,
+    scan: "ScanResult",
+    skips: list[str],
+    withholding: list[str],
+    unverified: list[str],
+) -> "IndexPassResult":
+    """One transaction of `_index_vault_pinned`: classification under the
+    generation lock through the commit. Raises `PoisonNote` (after which
+    nothing of it is committed) when a write site identifies poison notes."""
+    seen = scan.seen
     async with async_session() as session:
         # ── The generation lock, at the HEAD of this transaction (C1) ──────
         # **Not at the tsvector write, and this is a deadlock regression, not
@@ -2289,25 +2831,45 @@ async def _index_vault_pinned(
         # walk's verdict about it (including a shortcut skip) is never applied
         # to a row it was not made against. A path the walk already failed to
         # read stays the skip it is.
+        # D8: a scan read failure withholds a re-derive's stamp only if the
+        # locked rows have that path — a row-less unreadable file cannot hide
+        # a foreign row.
+        for rel, entry in scan.read_failures:
+            if rel in locked:
+                withholding.append(entry)
+
         reprocessed = 0
         for rel in sorted(seen):
-            if snapshot.get(rel) == locked.get(rel) or rel not in scan.files:
+            if snapshot.get(rel) == locked.get(rel):
+                continue
+            # A path decided not indexable by its *content* is re-read like a
+            # decoded one: its row moved under the walk, so the walk's verdict
+            # is not the one to apply (D7). A path not indexable by its *name*
+            # can have no row, so it never reaches here.
+            undecodable = scan.not_indexable.get(rel) == NOT_UTF8_CONTENT
+            if rel not in scan.files and not undecodable:
                 continue
             try:
                 scan.files[rel] = await asyncio.to_thread(_rescan_one, root_fd, rel)
+                scan.not_indexable.pop(rel, None)
                 reprocessed += 1
             except UnicodeDecodeError:
-                # C4 re-read, bytes read in full: decoded-content-only, so a
-                # skip that does not block the clock.
-                logger.warning(f"Skipping non-UTF8 file: {rel}")
-                skips.append(f"{rel} (not valid UTF-8)")
-                del scan.files[rel]
+                # C4 re-read, bytes read in full and not valid UTF-8: present
+                # but not indexable (D7) — its locked row is deleted below.
+                _warn_not_indexable(rel, NOT_UTF8_CONTENT)
+                scan.not_indexable[rel] = NOT_UTF8_CONTENT
+                scan.files.pop(rel, None)
             except Exception as e:
-                # C4 re-read failure, bytes not obtained: blocks the clock.
+                # C4 re-read failure, bytes not obtained: blocks the clock, and
+                # keeps the row — which is why it withholds if there is one.
                 logger.warning(f"Failed to read {rel}: {e}")
-                skips.append(f"{rel} ({e})")
-                unverified.append(f"{rel} ({e})")
-                del scan.files[rel]
+                entry = f"{rel} ({e})"
+                skips.append(entry)
+                unverified.append(entry)
+                if rel in locked:
+                    withholding.append(entry)
+                scan.files.pop(rel, None)
+                scan.not_indexable.pop(rel, None)
         if reprocessed:
             logger.info(
                 "Re-read %d path(s) whose row changed between the snapshot "
@@ -2316,14 +2878,30 @@ async def _index_vault_pinned(
                 log_suffix,
             )
 
-        # Every skip appended from here on blocks the backstop's clock, none
-        # of them being a decoded-content-only failure: a missing buffered
-        # body (read failure, including a non-UTF-8 re-read, left a row this
-        # pass did not rewrite), a parse failure (bytes hashed but the row not
-        # rewritten, so it can be stale), a C5 deferral under re-derive (a row
+        # Every skip appended from here on blocks the backstop's clock: a
+        # missing buffered body (a read failure left a row this pass did not
+        # rewrite; a non-UTF-8 re-read is D7's not-indexable instead), a
+        # parse failure (bytes hashed but the row not rewritten, so it can be
+        # stale), a C5 deferral under re-derive (a row
         # the walk could not speak for), the keyword vector's missing body and
         # the link rebuild's skips (derived rows this pass did not write).
         downstream_skips_from = len(skips)
+
+        # ── Quarantine (#308, D3) ─────────────────────────────────────────
+        # A file whose current hash is its quarantined hash is present but not
+        # indexable, by the D7 mechanism: out of `files` (so neither upserted
+        # nor a move destination; being `seen`, it is never a move source),
+        # into `not_indexable`, so any row at it is deleted below through the
+        # ordinary prune. Not a skip — it neither withholds a re-derive's stamp
+        # nor blocks the backstop's clock. Decided after the C4 re-read, so it
+        # applies to the bytes this attempt will actually act on.
+        quarantined_now: list[str] = []
+        for rel in sorted(scan.files):
+            q_hash = _quarantined_hash(user_id, rel)
+            if q_hash is not None and q_hash == scan.files[rel].content_hash:
+                del scan.files[rel]
+                scan.not_indexable[rel] = QUARANTINED
+                quarantined_now.append(rel)
 
         # Determine changes
         to_upsert = []
@@ -2387,9 +2965,16 @@ async def _index_vault_pinned(
                 # it was re-read with its body. Read it rather than trust that.
                 try:
                     found = await asyncio.to_thread(_rescan_one, root_fd, rel_path)
+                except UnicodeDecodeError:
+                    _warn_not_indexable(rel_path, NOT_UTF8_CONTENT)
+                    scan.not_indexable[rel_path] = NOT_UTF8_CONTENT
+                    continue
                 except Exception as e:
                     logger.warning(f"Failed to read {rel_path}: {e}")
-                    skips.append(f"{rel_path} ({e})")
+                    entry = f"{rel_path} ({e})"
+                    skips.append(entry)
+                    if rel_path in locked:
+                        withholding.append(entry)
                     continue
                 h = found.content_hash
             raw = found.raw
@@ -2406,10 +2991,27 @@ async def _index_vault_pinned(
                 # inside one, so this bounds the stall to the longest
                 # single scan step rather than to zero; that step is short
                 # because the grammars are linear.
-                tags = await asyncio.to_thread(extract_tags, content, frontmatter)
+                dropped_tags: list[int] = []
+                tags = await asyncio.to_thread(
+                    extract_tags, content, frontmatter, dropped=dropped_tags
+                )
+                if dropped_tags:
+                    # Sizes only, never the tag: it is note content (#308, D2).
+                    logger.warning(
+                        "Dropped %d tag(s) of %s byte(s) from %s: tags over "
+                        "%d bytes are not indexed",
+                        len(dropped_tags),
+                        ", ".join(str(n) for n in dropped_tags),
+                        _loggable_path(rel_path),
+                        MAX_TAG_BYTES,
+                    )
             except Exception as e:
                 logger.warning(f"Failed to parse {rel_path}: {e}")
-                skips.append(f"{rel_path} (parse: {e})")
+                entry = f"{rel_path} (parse: {e})"
+                skips.append(entry)
+                # Not upserted, so a row at the path survives unrewritten.
+                if rel_path in locked:
+                    withholding.append(entry)
                 continue
             path_to_content[rel_path] = content
             title = _note_title(frontmatter, found.name)
@@ -2453,6 +3055,10 @@ async def _index_vault_pinned(
                 **_stat_params(found.stat),
             })
 
+        # Every changed path's hash — moved ones included, which leave
+        # `to_upsert` below — for naming a poison note's quarantine entry.
+        upsert_hash = {e["file_path"]: e["content_hash"] for e in to_upsert}
+
         # Compute deleted paths up front so the move-detection block can
         # repair them before the delete/insert pipeline tears them apart.
         #
@@ -2475,7 +3081,10 @@ async def _index_vault_pinned(
                 log_suffix,
             )
             if re_derive:
-                skips.append(f"{p} (row changed mid-walk; deferred)")
+                # A deferred path has a locked row by construction.
+                entry = f"{p} (row changed mid-walk; deferred)"
+                skips.append(entry)
+                withholding.append(entry)
 
         # ── Move detection ────────────────────────────────────────────────
         # An external move (file dragged in Obsidian) looks like
@@ -2578,6 +3187,7 @@ async def _index_vault_pinned(
             )
 
             entry_by_path = {e["file_path"]: e for e in to_upsert}
+            poisoned_moves: list[PoisonCandidate] = []
             for old, new in moves:
                 e = entry_by_path[new]
                 params: dict = {
@@ -2591,17 +3201,36 @@ async def _index_vault_pinned(
                 }
                 if user_id is not None:
                     params["uid"] = user_id
-                await session.execute(move_upd_stmt, params)
 
                 old_no_ext = old[:-3] if old.endswith(".md") else old
                 new_no_ext = new[:-3] if new.endswith(".md") else new
-                for o, n in [(old, new), (old_no_ext, new_no_ext)]:
-                    tp_params: dict = {"new": n, "old": o}
-                    if user_id is not None:
-                        tp_params["uid"] = user_id
-                    await session.execute(text(move_tp_sql), tp_params)
+
+                async def _move(params=params, old=old, new=new,
+                                old_no_ext=old_no_ext, new_no_ext=new_no_ext):
+                    await session.execute(move_upd_stmt, params)
+                    for o, n in [(old, new), (old_no_ext, new_no_ext)]:
+                        tp_params: dict = {"new": n, "old": o}
+                        if user_id is not None:
+                            tp_params["uid"] = user_id
+                        await session.execute(text(move_tp_sql), tp_params)
+
+                # One savepoint per move (D3, site 1): a poison failure,
+                # confirmed by one retry (C8), quarantines the destination,
+                # and the re-run treats the source as an ordinary vanished
+                # file.
+                exc = await _savepoint_poison(session, _move)
+                if exc is not None:
+                    code = await _confirm_poison(
+                        session, _move, exc, site="move"
+                    )
+                    poisoned_moves.append(PoisonCandidate(
+                        new, e["content_hash"], code, "move"
+                    ))
+                    continue
 
                 moved_new_paths.add(new)
+            if poisoned_moves:
+                raise PoisonNote(poisoned_moves)
 
             logger.info(
                 f"Detected {len(moves)} file move(s) — preserved ids{log_suffix}"
@@ -2612,11 +3241,28 @@ async def _index_vault_pinned(
             to_upsert = [e for e in to_upsert if e["file_path"] not in moved_new_paths]
             deleted_paths -= {old for old, _ in moves}
 
+        # D7: a row at a present-but-not-indexable path is deleted through the
+        # ordinary prune below — embeddings and outgoing links cascade, inbound
+        # links fall back to dangling — so search never serves content the
+        # file no longer holds. Added after move detection on purpose: such a
+        # path is neither a move source nor (never being in `to_upsert`) a
+        # destination. No C5 test: every such path was seen by this walk, and
+        # one whose row moved under the walk was re-read under the lock above.
+        not_indexable_rows = {p for p in scan.not_indexable if p in existing}
+        if not_indexable_rows:
+            deleted_paths |= not_indexable_rows
+            logger.warning(
+                "Removing the index row(s) of %d present-but-not-indexable "
+                "path(s)%s: %s",
+                len(not_indexable_rows),
+                log_suffix,
+                _format_skips(sorted(not_indexable_rows)),
+            )
+
         # Upsert changed files
         if to_upsert:
-            for batch_start in range(0, len(to_upsert), 100):
-                batch = to_upsert[batch_start:batch_start + 100]
-                stmt = insert(NoteMetadata).values(batch)
+            def _upsert_stmt(rows):
+                stmt = insert(NoteMetadata).values(rows)
                 stmt = stmt.on_conflict_do_update(
                     # Match the composite UNIQUE(user_id, file_path) on
                     # notes_metadata (migration 009). The constraint is
@@ -2648,7 +3294,41 @@ async def _index_vault_pinned(
                         "indexed_at": text("now()"),
                     },
                 )
-                await session.execute(stmt)
+                return stmt
+
+            # D3, site 2. Each batch statement runs in a savepoint; one that
+            # fails with a poison SQLSTATE is replayed a row at a time, each
+            # row in its own savepoint, and **every** row that fails alone is
+            # quarantined in this one restart. If none fails alone the error
+            # is not attributable to a note and is re-raised as it was. A row
+            # that fails alone is retried once more before it is named (C8).
+            poisoned_rows: list[PoisonCandidate] = []
+            for batch_start in range(0, len(to_upsert), 100):
+                batch = to_upsert[batch_start:batch_start + 100]
+                batch_exc = await _savepoint_poison(
+                    session, lambda b=batch: session.execute(_upsert_stmt(b))
+                )
+                if batch_exc is None:
+                    continue
+                found_any = False
+                for row in batch:
+                    async def _row(r=row):
+                        await session.execute(_upsert_stmt([r]))
+
+                    row_exc = await _savepoint_poison(session, _row)
+                    if row_exc is not None:
+                        code = await _confirm_poison(
+                            session, _row, row_exc, site="upsert"
+                        )
+                        found_any = True
+                        poisoned_rows.append(PoisonCandidate(
+                            row["file_path"], row["content_hash"],
+                            code, "upsert",
+                        ))
+                if not found_any:
+                    raise batch_exc
+            if poisoned_rows:
+                raise PoisonNote(poisoned_rows)
             logger.info(f"Upserted {len(to_upsert)} notes")
 
         # The unchanged-hash stat refresh (D10). Conditional on the row's id,
@@ -2701,6 +3381,7 @@ async def _index_vault_pinned(
         # Update tsvectors for changed notes
         if to_upsert:
             paths = [n["file_path"] for n in to_upsert]
+            poisoned_tsv: list[PoisonCandidate] = []
             # In multi-user mode the same `file_path` can exist for multiple
             # users, so the UPDATE scopes by user: `user_id IS NULL` in
             # single-user mode, `user_id = :uid` (never NULL) in multi-user
@@ -2730,19 +3411,51 @@ async def _index_vault_pinned(
                 # `continue`: it leaves a row whose keyword vector this pass did
                 # not write, which a re-derive must not certify.
                 if path not in path_to_content:
-                    skips.append(f"{path} (no buffered body for the keyword vector)")
+                    entry = f"{path} (no buffered body for the keyword vector)"
+                    skips.append(entry)
+                    withholding.append(entry)  # in `to_upsert`: always (D8)
                     continue
                 content = path_to_content[path]
                 params: dict = {"path": path, **tsv_params}
                 if user_id is not None:
                     params["uid"] = user_id
                 # Full body first, halving retreat per note, floor failure
-                # re-raised — which aborts the pass with nothing committed,
-                # exactly as the unconditional `content[:100000]` did when it
-                # failed. See `write_tsvector_bounded`.
-                await write_tsvector_bounded(
-                    session, text(tsv_sql), content, params, label=path
-                )
+                # re-raised (see `write_tsvector_bounded`). D3, site 3: a floor
+                # failure with a poison SQLSTATE names this note for
+                # quarantine — the helper's own savepoint has already rolled
+                # back, so the remaining notes are still tried and every
+                # poison note of this stage goes in one restart. Any other
+                # floor failure aborts the pass with nothing committed. A
+                # poison floor failure is retried once at the floor before it
+                # is named (C8), and the helper does not log its driver text
+                # (a 22P02 DETAIL can quote the note): the quarantine's own
+                # ERROR is the one line.
+                try:
+                    await write_tsvector_bounded(
+                        session, text(tsv_sql), content, params, label=path,
+                        quiet_poison_floor=True,
+                    )
+                except Exception as exc:
+                    if poison_sqlstate(exc) is None:
+                        raise
+
+                    async def _floor(content=content, params=params):
+                        await session.execute(
+                            text(tsv_sql),
+                            {
+                                **params,
+                                "content": content[:TSVECTOR_CONTENT_FLOOR_CHARS],
+                            },
+                        )
+
+                    code = await _confirm_poison(
+                        session, _floor, exc, site="keyword-vector"
+                    )
+                    poisoned_tsv.append(PoisonCandidate(
+                        path, upsert_hash[path], code, "keyword-vector"
+                    ))
+            if poisoned_tsv:
+                raise PoisonNote(poisoned_tsv)
             logger.info(f"Updated tsvectors for {len(paths)} notes{log_suffix}")
 
         # Remove deleted files (scoped to this user when set). `deleted_paths`
@@ -2767,21 +3480,34 @@ async def _index_vault_pinned(
         # Moved notes need outgoing-link re-extraction too: same-folder
         # resolution can change once the note sits in a different directory.
         if to_upsert or deleted_paths or moved_new_paths:
+            # Every link-rebuild skip is on a changed path — one this pass
+            # selected for upsert or moved — so every one withholds (D8).
+            link_skips: list[str] = []
+            # D3, site 4: each note's link inserts in their own savepoint.
+            poisoned_links: list[tuple[str, str]] = []
             await _update_links_for_changed(
                 session,
                 vault,
                 [n["file_path"] for n in to_upsert] + list(moved_new_paths),
                 user_id=user_id,
                 path_to_content=path_to_content,
-                skips=skips,
+                skips=link_skips,
+                poisoned=poisoned_links,
             )
+            if poisoned_links:
+                raise PoisonNote([
+                    PoisonCandidate(path, upsert_hash[path], code, "links")
+                    for path, code in poisoned_links
+                ])
+            skips.extend(link_skips)
+            withholding.extend(link_skips)
 
         # ── The tail stamp ────────────────────────────────────────────────
         # Written where the state it describes is established. On the re-derive
         # branch that state is "every surviving row was derived from this
         # root", which is not true until the pass has finished — so the stamp
-        # is issued after the pass's last write and **only if it skipped
-        # nothing**. Head-stamping a re-derive would be exactly the false
+        # is issued after the pass's last write and **only if no skip could
+        # hide a row** (`withholding`, D8). Head-stamping a re-derive would be exactly the false
         # provenance this record exists to prevent, written by our own code
         # instead of by a migration.
         #
@@ -2789,17 +3515,35 @@ async def _index_vault_pinned(
         # a crash mid-repair leave the previous record untouched, so the next
         # pass repairs again: bounded, idempotent, and never a stamp over a
         # half-repaired index.
+        rederive: str | None = None
         if re_derive and facts is not None:
-            if skips:
+            if withholding:
+                rederive = REDERIVE_INCOMPLETE
                 logger.warning(
                     "Re-derive incomplete%s: %d discovered path(s) were not "
-                    "fully processed, so no provenance was recorded and the "
-                    "next pass will re-derive again. Offenders: %s",
+                    "fully processed and could hide a row, so no provenance "
+                    "was recorded and the next pass will re-derive again. "
+                    "Offenders: %s",
                     log_suffix,
-                    len(skips),
-                    _format_skips(skips),
+                    len(withholding),
+                    _format_skips(withholding),
                 )
+                if len(skips) > len(withholding):
+                    logger.warning(
+                        "%d other path(s) were not fully processed%s: %s",
+                        len(skips) - len(withholding),
+                        log_suffix,
+                        _format_skips([x for x in skips if x not in withholding]),
+                    )
             else:
+                if skips:
+                    logger.warning(
+                        "%d discovered path(s) were not fully processed%s, "
+                        "none with a row they could hide: %s",
+                        len(skips),
+                        log_suffix,
+                        _format_skips(skips),
+                    )
                 # The same binding as the discard's, for the same reason: this
                 # stamp is provenance too, and a record written under an
                 # assignment the row no longer names is exactly the false
@@ -2825,6 +3569,7 @@ async def _index_vault_pinned(
                         )
                         stamped = await _stamp_provenance(session, user_id, facts)
                 except ProvenanceLockUnavailable as exc:
+                    rederive = REDERIVE_UNRECORDED
                     logger.warning(
                         "Re-derive complete but not recorded%s: %s. The "
                         "repairs are committed; the next pass will re-derive "
@@ -2833,6 +3578,7 @@ async def _index_vault_pinned(
                         exc,
                     )
                 except ProvenanceRaceAborted as exc:
+                    rederive = REDERIVE_UNRECORDED
                     logger.warning(
                         "Re-derive complete but not recorded%s: %s. The next "
                         "pass will reclassify and re-derive again.",
@@ -2845,6 +3591,7 @@ async def _index_vault_pinned(
                             f"Re-derive stamp{log_suffix} matched {stamped} "
                             f"row(s) for user_id={user_id}, not exactly one."
                         )
+                    rederive = REDERIVE_RECORDED
                     logger.info(
                         "Re-derive complete%s: recorded provenance "
                         "assignment=%r realpath=%r handle=%s",
@@ -2871,7 +3618,8 @@ async def _index_vault_pinned(
     # **and read and hashed every discovered file's bytes** (D12). One that
     # aborted, was refused or cancelled never reaches this line; one that
     # committed with a blocking skip leaves the scope due, so its next pass is
-    # again a full-hash pass. A non-UTF-8 file does not block (see `skips`).
+    # again a full-hash pass. A present-but-not-indexable path (D7) is not a
+    # skip and does not block.
     blocking_skips = unverified + skips[downstream_skips_from:]
     if backstop and not blocking_skips:
         _last_full_hash[user_id] = time.monotonic()
@@ -2885,12 +3633,31 @@ async def _index_vault_pinned(
             _format_skips(blocking_skips),
         )
 
+    # Quarantine entries this committed pass has made obsolete (D3): a note
+    # that indexed (its new content no longer fails), a file the walk no
+    # longer found, and one now not indexable for a D7 reason (its row is
+    # gone either way). An entry whose file still hashes to it stays, and so
+    # does one whose file this pass could not read — nothing is known.
+    written = {n["file_path"] for n in to_upsert} | moved_new_paths
+    still_quarantined = set(quarantined_now)
+    for rel in quarantined_paths(user_id):
+        if rel in still_quarantined:
+            continue
+        if rel in written or rel not in seen or rel in scan.not_indexable:
+            clear_quarantine(user_id, rel)
+
     logger.info(f"Vault index scan complete{log_suffix}")
     # For the run recorder: what the walk saw, and what this pass wrote. The
     # moved paths count as indexed — the id-preserving branch rewrote those
     # rows — and they were removed from `to_upsert` above, so the two sets are
     # disjoint and nothing is double-counted.
-    return len(seen), len(to_upsert) + len(moved_new_paths)
+    return IndexPassResult(
+        len(seen),
+        len(to_upsert) + len(moved_new_paths),
+        rederive=rederive,
+        not_indexable=len(scan.not_indexable) - len(quarantined_now),
+        quarantined=tuple(quarantined_now),
+    )
 
 
 async def _update_links_for_changed(
@@ -2900,8 +3667,15 @@ async def _update_links_for_changed(
     user_id: int | None = None,
     path_to_content: dict[str, str] | None = None,
     skips: list[str] | None = None,
+    poisoned: list[tuple[str, str]] | None = None,
 ):
     """Re-extract and upsert links for the given changed paths.
+
+    With `poisoned` (the incremental index pass, #308 D3), each note's link
+    inserts run in their own savepoint, and a note whose inserts fail with a
+    poison SQLSTATE is appended as `(path, sqlstate)` instead of aborting; once
+    any is, the function returns after the per-note loop so the caller can
+    restart without it. Without it (the link backfill) behaviour is unchanged.
 
     Builds a fresh `vault_index` from `notes_metadata`, then for every changed
     note: deletes existing rows, extracts links, resolves targets, inserts.
@@ -3028,16 +3802,33 @@ async def _update_links_for_changed(
                     )
                 else:
                     complete_ids.append(src_id)
-                for batch_start in range(0, len(note_rows), 1000):
-                    await session.execute(
-                        insert(NoteLink).values(
-                            note_rows[batch_start:batch_start + 1000]
+
+                async def _insert_rows(note_rows=note_rows):
+                    for batch_start in range(0, len(note_rows), 1000):
+                        await session.execute(
+                            insert(NoteLink).values(
+                                note_rows[batch_start:batch_start + 1000]
+                            )
                         )
-                    )
+
+                if poisoned is None:
+                    await _insert_rows()
+                elif note_rows:
+                    exc = await _savepoint_poison(session, _insert_rows)
+                    if exc is not None:
+                        # Confirmed by one retry before it is named (C8).
+                        code = await _confirm_poison(
+                            session, _insert_rows, exc, site="links"
+                        )
+                        poisoned.append((path, code))
                 total_rows += len(note_rows)
                 # Explicit, so the peak this block exists to bound is not held
                 # across the next note's extraction by a stale binding.
                 note_rows = []
+
+            if poisoned:
+                # The caller rolls this attempt back and restarts.
+                return
 
             # The marker is derived state, exactly like the rows: set where
             # this pass capped, cleared where it did not, in the same
@@ -5987,6 +6778,63 @@ async def prewarm_search_caches() -> None:
         )
 
 
+def _embed_failures(result) -> int:
+    """How many notes an embed pass failed, for `indexer_health`.
+
+    `embed_vault` is monkeypatched with plain no-op coroutines throughout the
+    tests, so anything that is not an `EmbedPassResult` reports none.
+    """
+    if isinstance(result, EmbedPassResult):
+        return result.failures
+    return 0
+
+
+#: `IndexPassResult.rederive` → `indexer_health.record_rederive`'s argument.
+#: `REDERIVE_UNRECORDED` (the stamp itself was refused by a lock or an
+#: assignment race, nothing withheld it) maps to False — "not recorded" —
+#: because its consequence is the incomplete one: the next tick re-derives the
+#: whole scope again. A one-off race bumps the counter once and the next
+#: recording pass resets it; only a race that persists for
+#: `INDEXER_DEGRADED_AFTER_FAILURES` consecutive passes — a full-scope rewrite
+#: every tick, the #308 cost — reaches degraded.
+_REDERIVE_HEALTH = {
+    None: None,
+    REDERIVE_RECORDED: True,
+    REDERIVE_INCOMPLETE: False,
+    REDERIVE_UNRECORDED: False,
+}
+
+
+def record_index_outcome(user_id: int | None, ok: bool, result=None) -> None:
+    """Record one index stage's outcome for `indexer_health` (#308, D4).
+
+    Every entrypoint calls this — the startup pass, the periodic tick in both
+    modes, and the panel's Reindex now — so the counters mean the same thing
+    whichever path ran the pass. `ok` means `index_vault` returned without
+    raising (a pass that quarantined a note returned, so it counts as ok).
+    `result` is what it returned; its `rederive` verdict (D8) feeds the
+    incomplete-re-derive counter. Anything else (a test's no-op stub) is
+    recorded as "not a re-derive".
+    """
+    indexer_health.record_index(user_id, ok)
+    if ok:
+        verdict = getattr(result, "rederive", None)
+        indexer_health.record_rederive(
+            user_id, _REDERIVE_HEALTH.get(verdict, None)
+        )
+
+
+def record_embed_outcome(
+    user_id: int | None, result=None, *, raised: bool = False
+) -> None:
+    """Record one embed stage's outcome for `indexer_health` (#308, D4).
+
+    A stage that raised counts as one failed embed pass; one that returned
+    counts its `EmbedPassResult.failures`.
+    """
+    indexer_health.record_embed(user_id, 1 if raised else _embed_failures(result))
+
+
 async def _index_pass_once(user_id: int | None, trigger: str = "scheduled") -> bool:
     """One full index + embed pass for a single user (or single-user mode).
 
@@ -6001,21 +6849,34 @@ async def _index_pass_once(user_id: int | None, trigger: str = "scheduled") -> b
     A pass that swallowed a failure and recorded a clean row would reproduce
     the same defect one layer down: the log line scrolls away, the row is what
     survives a redeploy.
+
+    Used for single-user mode too (`user_id=None`, #308 D9): a failed index
+    stage used to jump past the embed stage there, so committed rows went
+    unembedded for as long as the index kept failing. Each stage's outcome is
+    recorded in `indexer_health` so both modes count failures identically.
     """
     ok = True
     async with record_indexer_run(trigger, user_id) as stats:
         try:
-            stats.record_index(await index_vault(user_id=user_id))
+            index_result = await index_vault(user_id=user_id)
+            stats.record_index(index_result)
         except Exception as e:
             ok = False
             stats.record_error("index", e)
+            record_index_outcome(user_id, False)
             logger.error(f"Index failed (user_id={user_id}): {e}")
+        else:
+            record_index_outcome(user_id, True, index_result)
         try:
-            stats.record_embedded(await embed_vault(user_id=user_id))
+            embedded = await embed_vault(user_id=user_id)
         except Exception as e:
             ok = False
             stats.record_error("embed", e)
+            record_embed_outcome(user_id, raised=True)
             logger.error(f"Embedding failed (user_id={user_id}): {e}")
+        else:
+            stats.record_embedded(embedded)
+            record_embed_outcome(user_id, embedded)
     return ok
 
 
@@ -6025,13 +6886,22 @@ async def run_indexer_loop():
     Multi-user mode iterates active users sequentially per pass (v1 simplicity;
     parallelism can come later). Single-user mode runs one legacy pass with
     `user_id=None`.
+
+    Failure accounting lives in `indexer_health` (#308, D4): per scope from
+    every stage, plus a tick-level counter for work not attributable to a
+    scope (overlap detection, user enumeration, a tick that raised outside
+    every scope's stages). `/health` reads it.
     """
+    # `/health` counts this process's quarantine (#308, D3). Also installed at
+    # import; repeated here so the loop that maintains the registry always
+    # reports it.
+    indexer_health.set_quarantine_count_provider(quarantine_count)
     # E2 — the startup pass. Before `index_pass_lock`, so the check does not
     # queue behind the pass it gates. The lifespan (E1) has normally published
     # one already; this is not redundant, because `run_indexer_loop` is started
     # by paths that are not the lifespan in tests and could be in future, and a
     # second detection here costs N bounded root observations.
-    await detect_root_overlaps("startup")
+    startup_overlap_ok = await detect_root_overlaps("startup") is not False
     # Hold `index_pass_lock` for the initial pass too, so a panel-triggered
     # `_reindex_background` fired during startup is serialized against it.
     startup_ok = True
@@ -6056,11 +6926,15 @@ async def run_indexer_loop():
             for uid in await _rotated_user_ids():
                 async with record_indexer_run("startup", uid) as stats:
                     try:
-                        stats.record_index(await index_vault(user_id=uid))
+                        index_result = await index_vault(user_id=uid)
+                        stats.record_index(index_result)
                     except Exception as e:
                         startup_ok = False
                         stats.record_error("index", e)
+                        record_index_outcome(uid, False)
                         logger.error(f"Initial index failed (user_id={uid}): {e}")
+                    else:
+                        record_index_outcome(uid, True, index_result)
                     try:
                         # The backfill writes its own `backfill` row; the note
                         # here is so an operator reading a startup row sees
@@ -6071,11 +6945,15 @@ async def run_indexer_loop():
                         stats.record_error("link backfill", e)
                         logger.error(f"Link backfill failed (user_id={uid}): {e}")
                     try:
-                        stats.record_embedded(await embed_vault(user_id=uid))
+                        embedded = await embed_vault(user_id=uid)
                     except Exception as e:
                         startup_ok = False
                         stats.record_error("embed", e)
+                        record_embed_outcome(uid, raised=True)
                         logger.error(f"Initial embedding failed (user_id={uid}): {e}")
+                    else:
+                        stats.record_embedded(embedded)
+                        record_embed_outcome(uid, embedded)
                 # After this user's whole sequence, success or failure, and
                 # **outside** the recorder's context so its own short session
                 # has closed first.
@@ -6083,11 +6961,15 @@ async def run_indexer_loop():
         else:
             async with record_indexer_run("startup", None) as stats:
                 try:
-                    stats.record_index(await index_vault())
+                    index_result = await index_vault()
+                    stats.record_index(index_result)
                 except Exception as e:
                     startup_ok = False
                     stats.record_error("index", e)
+                    record_index_outcome(None, False)
                     logger.error(f"Initial index failed: {e}")
+                else:
+                    record_index_outcome(None, True, index_result)
 
                 try:
                     await link_backfill_pass()
@@ -6097,18 +6979,22 @@ async def run_indexer_loop():
                     logger.error(f"Link backfill failed: {e}")
 
                 try:
-                    stats.record_embedded(await embed_vault())
+                    embedded = await embed_vault()
                 except Exception as e:
                     startup_ok = False
                     stats.record_error("embed", e)
+                    record_embed_outcome(None, raised=True)
                     logger.error(f"Initial embedding failed: {e}")
+                else:
+                    stats.record_embedded(embedded)
+                    record_embed_outcome(None, embedded)
 
+    indexer_health.record_enumeration(startup_overlap_ok)
     # The startup pass counts as a run: it does the same work a tick does, and
     # without it the dashboard would read "Never" for a whole interval after
     # every restart.
     _record_index_run(startup_ok)
 
-    consecutive_failures = 0
     logger.info(
         f"Periodic indexer loop armed (interval={settings.index_interval_seconds}s, "
         f"multi_user={settings.multi_user_mode})"
@@ -6116,7 +7002,7 @@ async def run_indexer_loop():
     while True:
         await asyncio.sleep(settings.index_interval_seconds)
         logger.info("Periodic indexer tick")
-        # The whole tick body is guarded so the refusal flush below runs on
+        # The whole tick body is guarded so the housekeeping below runs on
         # **every** path out of it — see the `finally`.
         try:
             # E3 — every periodic iteration, **before** the pause check and
@@ -6125,9 +7011,10 @@ async def run_indexer_loop():
             # the pause is entered precisely when an operator is doing
             # something destructive and watching the panel, which is the worst
             # moment for a quarantine to go unpublished and unrecorded.
-            await detect_root_overlaps("periodic")
+            overlap_ok = await detect_root_overlaps("periodic") is not False
             if _is_paused():
                 logger.info("Periodic tick skipped (paused)")
+                indexer_health.record_enumeration(overlap_ok)
                 # The snapshot has been published and the ERROR logged; the run
                 # rows are the half that survives a restart, so a paused
                 # iteration writes them before it returns. No index or embed
@@ -6145,7 +7032,12 @@ async def run_indexer_loop():
                         # newly-deactivated users are picked up without a restart.
                         # One user's failure does not abort the others, but it
                         # does make the whole tick a failed run.
-                        for uid in await _rotated_user_ids():
+                        uids = await _rotated_user_ids()
+                        # A user no longer active must not hold `/health` at
+                        # degraded with counts from their last passes.
+                        indexer_health.retain_scopes(uids)
+                        retain_quarantine_scopes(uids)
+                        for uid in uids:
                             if not await _index_pass_once(uid):
                                 tick_ok = False
                             # Advanced whether the pass succeeded or failed: the
@@ -6154,22 +7046,20 @@ async def run_indexer_loop():
                             # starve every tenant after them.
                             await _advance_rotation_cursor(uid)
                     else:
-                        # Not routed through `_index_pass_once`: that helper
-                        # swallows per-stage exceptions so one user cannot stop the
-                        # others, and in single-user mode a raising pass must reach
-                        # the outer handler so `consecutive_failures` sees it. The
-                        # run row is still written — `record_indexer_run` records
-                        # the exception on its way past.
-                        async with record_indexer_run("scheduled", None) as stats:
-                            stats.record_index(await index_vault())
-                            stats.record_embedded(await embed_vault())
+                        # Through `_index_pass_once`, like every tenant in
+                        # multi-user mode (#308 D9): a failed index stage is
+                        # recorded and the embed stage still runs over the rows
+                        # already committed. The per-stage outcome reaches
+                        # `indexer_health`, which replaces the old loop-local
+                        # `consecutive_failures`.
+                        if not await _index_pass_once(None):
+                            tick_ok = False
                     # Still under the lock: serialised against a panel reindex and
                     # against reset-embeddings, which also takes this lock. It
-                    # never raises, so `consecutive_failures` cannot react to it,
-                    # and it delays the next tick by at most PREWARM_TIMEOUT_SECONDS.
+                    # never raises, and it delays the next tick by at most
+                    # PREWARM_TIMEOUT_SECONDS.
                     await prewarm_search_caches()
-                await cleanup_expired_tokens()
-                consecutive_failures = 0
+                indexer_health.record_enumeration(overlap_ok)
                 # Heartbeat: the tick completed. Recorded whether or not the pass
                 # found anything to index — that is the whole point (#78) — but
                 # `tick_ok` is False if any per-user pass swallowed an exception,
@@ -6177,16 +7067,29 @@ async def run_indexer_loop():
                 # healthy just because the loop itself survived.
                 _record_index_run(tick_ok)
             except Exception as e:
-                consecutive_failures += 1
+                # Reached only by work no scope owns — user enumeration, a run
+                # row that could not be opened, the rotation cursor — so it is
+                # counted on the tick-level counter, which logs the CRITICAL
+                # line once when it reaches `INDEXER_DEGRADED_AFTER_FAILURES`.
+                indexer_health.record_enumeration(False)
                 # A tick that raised still *ran*; the dashboard says so and marks
                 # it failed rather than showing a stale-looking success.
                 # `CancelledError` is a BaseException and does not land here, so
                 # lifespan shutdown is not recorded as a failed pass.
                 _record_index_run(False)
-                logger.error(f"Periodic task failed ({consecutive_failures} consecutive): {e}")
-                if consecutive_failures >= 5:
-                    logger.critical("Indexer has failed 5+ consecutive times — manual intervention required")
+                logger.error(f"Periodic task failed: {e}")
         finally:
+            # The token, authorization-code and unused-OAuth-client sweep.
+            # **In the `finally`, in its own `try`** (#308 D9): it is the only
+            # caller of those sweeps, and it used to sit after the pass, which
+            # only a healthy tick reaches — so a failing indexer also stopped
+            # expiring credentials. A failure here is housekeeping and never
+            # fails the tick. `CancelledError` is not an `Exception` and
+            # propagates, so lifespan shutdown is unaffected.
+            try:
+                await cleanup_expired_tokens()
+            except Exception as e:  # noqa: BLE001 - housekeeping, never fatal
+                logger.error(f"Expired-token cleanup failed: {e}")
             # The refusal coalescer's standalone flush: any window that closed
             # since the last tick writes the row it owes, so a principal that
             # was refused in a burst and then went quiet still has its count
@@ -6195,7 +7098,7 @@ async def run_indexer_loop():
             #
             # **In the `finally`, so every path out of the tick reaches it.**
             # It used to sit after `cleanup_expired_tokens()`, which only a
-            # *healthy* tick reaches: a paused tick `continue`s above it and a
+            # *healthy* tick reached: a paused tick `continue`s above it and a
             # failing tick jumps past it into the handler, so on a deployment
             # that was paused, or failing, the counts accumulated in memory and
             # were written only if the process happened to shut down cleanly.

@@ -170,10 +170,10 @@ def block_the_walk(monkeypatch):
     release = threading.Event()
     real = indexer.read_note_at
 
-    def blocked(parent_fd, name):
+    def blocked(parent_fd, name, rel=None):
         reading.set()
         release.wait(30)
-        return real(parent_fd, name)
+        return real(parent_fd, name, rel)
 
     monkeypatch.setattr(indexer, "read_note_at", blocked)
     return reading, release
@@ -256,12 +256,12 @@ async def test_a_move_committed_during_the_walk_that_it_sees_neither_side_of_is_
     walked: list[str] = []
     real = indexer.read_note_at
 
-    def held(parent_fd, name):
+    def held(parent_fd, name, rel=None):
         walked.append(name)
         if name == "Sentinel.md" and not in_private.is_set():
             in_private.set()
             release.wait(30)
-        return real(parent_fd, name)
+        return real(parent_fd, name, rel)
 
     monkeypatch.setattr(indexer, "read_note_at", held)
 
@@ -310,9 +310,9 @@ async def test_a_row_another_process_changed_is_re_decided_under_the_lock(
     reads: list[str] = []
     real = indexer.read_note_at
 
-    def counting(parent_fd, name):
+    def counting(parent_fd, name, rel=None):
         reads.append(name)
-        return real(parent_fd, name)
+        return real(parent_fd, name, rel)
 
     monkeypatch.setattr(indexer, "read_note_at", counting)
 
