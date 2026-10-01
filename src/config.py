@@ -346,6 +346,11 @@ class Settings(BaseSettings):
     vault_path: str = "/obsidian"
     secret_key: str = "changeme"
     index_interval_seconds: int = Field(300, ge=1)
+    # Consecutive failures of any indexer counter (a scope's index passes, its
+    # embed passes, its incomplete re-derives, or the tick's own user
+    # enumeration) at which `/health` reports `degraded` and the CRITICAL
+    # "manual intervention required" line is logged once (#308, D4).
+    indexer_degraded_after_failures: int = Field(3, ge=1)
     # The scan's stat shortcut (#282): skip reading and hashing a note whose
     # current `(size, mtime_ns, ctime_ns, inode)` equals the tuple recorded for
     # the bytes that produced its row. Safe on local Linux filesystems (every

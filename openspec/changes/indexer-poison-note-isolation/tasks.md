@@ -19,11 +19,11 @@
 
 ## 3. Failure accounting and `/health` (D4)
 
-- [ ] 3.1 Per-scope registry: index failures, `rederive_incomplete`, embedding failures (from typed `EmbedPassResult` provider failures), last success/failure; enumeration-failure counter; updated from every entrypoint in both modes; replace the local counter in `run_indexer_loop`
-- [ ] 3.2 `_on_indexer_done` records "task not running" on exception/unexpected return, not on lifespan cancellation; `disabled` under `MCP_SANDBOX_MODE`
-- [ ] 3.3 `INDEXER_DEGRADED_AFTER_FAILURES` (default 3); CRITICAL log once per counter on reaching it, re-armed on reset
-- [ ] 3.4 `/health`: `indexer` object and `degraded` top-level status per spec; HTTP 200; no paths/errors/ids; update docstring
-- [ ] 3.5 Unit tests: ok; degraded by index failures / embedding failures / dead task / enumeration failures / quarantine; disabled; multi-user counting; CRITICAL-once; body contains no path or id
+- [x] 3.1 Per-scope registry: index failures, `rederive_incomplete`, embedding failures (from typed `EmbedPassResult` provider failures), last success/failure; enumeration-failure counter; updated from every entrypoint in both modes; replace the local counter in `run_indexer_loop`
+- [x] 3.2 `_on_indexer_done` records "task not running" on exception/unexpected return, not on lifespan cancellation; `disabled` under `MCP_SANDBOX_MODE`
+- [x] 3.3 `INDEXER_DEGRADED_AFTER_FAILURES` (default 3); CRITICAL log once per counter on reaching it, re-armed on reset
+- [x] 3.4 `/health`: `indexer` object and `degraded` top-level status per spec; HTTP 200; no paths/errors/ids; update docstring
+- [x] 3.5 Unit tests: ok; degraded by index failures / embedding failures / dead task / enumeration failures / quarantine; disabled; multi-user counting; CRITICAL-once; body contains no path or id
 
 ## 3b. Bug-hunt folds (D7, D8, D9, D2 tag bound)
 
@@ -31,13 +31,13 @@
 - [x] 3b.2 Re-derive stamp: withhold only for a skip with a locked row, a directory walk failure, or a skip on a path in `to_upsert`; incomplete re-derive counted by D4 — signal: `IndexPassResult.rederive` / `.rederive_incomplete`; the D4 counter is wired by the D4 slice
 - [ ] 3b.3 Batch replay quarantines every row that fails alone in one restart; run-record paths rendered with `backslashreplace`
 - [x] 3b.4 `vault.extract_tags`: drop tags > 1,024 UTF-8 bytes with a WARNING
-- [ ] 3b.5 Single-user loop: index stage caught on its own; embed still runs; `cleanup_expired_tokens` in the tick's `finally`, own `try`
-- [ ] 3b.6 Tests per design D6 "Bug-hunt tests" — D7/D8/D2-tag tests done (`tests/test_issue_308_nul_derivation.py`, `tests/integration/test_issue_308_nul_derivation_pg.py`); three-poison-row batch and single-user loop tests remain (D3/D9 slice)
+- [x] 3b.5 Single-user loop: index stage caught on its own; embed still runs; `cleanup_expired_tokens` in the tick's `finally`, own `try`
+- [ ] 3b.6 Tests per design D6 "Bug-hunt tests" — D7/D8/D2-tag tests done (`tests/test_issue_308_nul_derivation.py`, `tests/integration/test_issue_308_nul_derivation_pg.py`); single-user loop tests done (`tests/test_issue_308_indexer_health.py`); three-poison-row batch test remains (D3 slice)
 
 ## 4. Docs
 
 - [ ] 4.1 `docs/architecture/indexing-and-embeddings.md`: NUL rule, quarantine rule, revised floor-failure bullet, "a quarantine is not a read failure", D7 not-indexable rule, D8 re-derive stamp rule (and fix the stale "reads in full" rationale), `vault-tools.md` tag bound — done: NUL rule, D7, D8 (stale rationale fixed), `vault-tools.md` tag bound, `vault-roots-and-tenancy.md` completeness bullet; quarantine and floor-failure bullet remain (D3 slice)
-- [ ] 4.2 `DEPLOYMENT.md` / `README.md`: monitor `/health` `status` by keyword, not status code; new settings
+- [x] 4.2 `DEPLOYMENT.md` / `README.md`: monitor `/health` `status` by keyword, not status code; new settings
 - [ ] 4.3 `CLAUDE.md` key-decisions line for the quarantine and `/health` degraded
 
 ## 5. Gates
