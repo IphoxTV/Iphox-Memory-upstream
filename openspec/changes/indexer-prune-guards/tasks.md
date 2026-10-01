@@ -18,7 +18,7 @@
 
 ## 4. Panel (D5)
 
-- [ ] 4.1 Admin-only confirmation page (own salt; token binds action, scope, admin id, assignment, nonce; 10-min expiry; atomic nonce consumption) stating the row count + POST action that checks eligibility, grants the permission, and starts a new **scope-targeted** background pass; existing `_reindex_background` callers unchanged; WARNING with admin username and scope
+- [ ] 4.1 Admin-only confirmation page (own salt; token binds action, scope, admin id, assignment, process epoch, nonce; 10-min expiry; atomic nonce consumption) stating the row count + POST action that checks eligibility, grants the permission, and starts a new **scope-targeted** background pass; existing `_reindex_background` callers unchanged; WARNING with admin username and scope
 - [ ] 4.2 Single-user: settings Danger zone control; multi-user: user edit page control; CSP rules (`data-*`, nonce, `type="button"` + `data-confirm`, no inline style)
 
 ## 5. Tests (D6)
