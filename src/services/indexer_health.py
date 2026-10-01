@@ -36,6 +36,7 @@ resets — once per episode, not once per tick.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Iterable
@@ -49,6 +50,36 @@ Scope = int | None
 _INDEX = "index"
 _EMBED = "embed"
 _REDERIVE = "rederive"
+
+#: The start of the run-record line a pass that quarantined notes writes into
+#: `indexer_runs.error` (#308, D5). Produced by `indexer.format_quarantined`
+#: and recognised by `run_outcome` — one constant, so the two cannot drift.
+QUARANTINED_RUN_PREFIX = "quarantined "
+_QUARANTINED_RUN_LINE = re.compile(
+    re.escape(QUARANTINED_RUN_PREFIX) + r"\d+ note\(s\): "
+)
+
+RUN_OK = "ok"
+RUN_QUARANTINED = "quarantined"
+RUN_FAILED = "failed"
+
+
+def run_outcome(error: str | None) -> str:
+    """How the panel labels one `indexer_runs` row by its `error` text.
+
+    A pass that quarantined notes **succeeded** (D5) but names them in
+    `error`, so a non-empty `error` is not on its own a failure. The row is
+    `quarantined` only when every line of `error` is a quarantine line —
+    `format_quarantined` escapes line breaks in the paths it names, so a line
+    of the record is either wholly that line or another stage's report, and
+    any other line (a stage that raised, embed failures) makes it `failed`.
+    """
+    if not error:
+        return RUN_OK
+    lines = error.split("\n")
+    if all(_QUARANTINED_RUN_LINE.match(line) for line in lines):
+        return RUN_QUARANTINED
+    return RUN_FAILED
 
 
 @dataclass

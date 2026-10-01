@@ -785,7 +785,8 @@ TSVECTOR_CONTENT_FLOOR_CHARS = 100_000
 
 
 async def write_tsvector_bounded(
-    session, statement, content: str, params: dict, *, label: str
+    session, statement, content: str, params: dict, *, label: str,
+    quiet_poison_floor: bool = False,
 ) -> int:
     """Run one `content_tsvector` UPDATE, retreating on failure. Returns the
     prefix length that succeeded.
@@ -833,6 +834,12 @@ async def write_tsvector_bounded(
         except Exception as exc:
             if length <= TSVECTOR_CONTENT_FLOOR_CHARS:
                 # The floor. Propagate exactly as the pre-change code did.
+                # `quiet_poison_floor` (the incremental pass): a poison floor
+                # failure goes to quarantine, whose own ERROR names the path
+                # and SQLSTATE; the driver's message is not logged, because
+                # a 22P02 DETAIL can quote the note's text (#308).
+                if quiet_poison_floor and poison_sqlstate(exc) is not None:
+                    raise
                 logger.exception(
                     "Failed to update the keyword vector for %s at %d "
                     "characters, at or below the %d-character floor; "
@@ -885,17 +892,46 @@ QUARANTINED = "quarantined after a poison database failure"
 QUARANTINE_REPORT_LIMIT = 5
 
 
+def _is_connection_failure(e: BaseException) -> bool:
+    """A connection, interface or session-state failure: never poison, whatever
+    it wraps (C4). Judged only on an exception that carries no SQLSTATE of its
+    own — one that does is decided by that SQLSTATE."""
+    import asyncpg.exceptions as _apg
+    import sqlalchemy.exc as _sa_exc
+
+    if isinstance(e, (OSError, ConnectionError, _apg.InterfaceError,
+                      _apg.PostgresConnectionError,
+                      _sa_exc.InvalidRequestError)):
+        # InvalidRequestError covers PendingRollbackError and
+        # ResourceClosedError: session/transaction state, never note data.
+        return True
+    if isinstance(e, _sa_exc.DBAPIError) and e.connection_invalidated:
+        return True
+    # A DB-API `InterfaceError` of any driver (SQLAlchemy's asyncpg adapter
+    # included) is by definition a failure of the interface, not of data.
+    return type(e).__name__ == "InterfaceError" and not isinstance(
+        e, _sa_exc.DBAPIError
+    )
+
+
 def poison_sqlstate(exc: BaseException) -> str | None:
     """The poison SQLSTATE behind `exc`, or None if it is not a poison failure.
 
-    Walks the SQLAlchemy wrapper (`DBAPIError.orig`), the driver exception and
-    their `__cause__` / `__context__` chain. The **first** SQLSTATE found
-    decides — a wrapper that says serialization failure is not reclassified
-    by something deeper. asyncpg's *client-side* bind failure (a lone
-    surrogate the server would never see) surfaces as
+    Inspects the exception itself, the SQLAlchemy wrapper's driver exception
+    (`DBAPIError.orig`) and the explicit `__cause__` chain — **never**
+    `__context__` (C4): an exception raised while another was being handled,
+    such as a savepoint rollback that failed on a dead connection after a
+    poison statement, must not inherit that statement's classification. The
+    **first** SQLSTATE found decides — a wrapper that says serialization
+    failure is not reclassified by something deeper — and a connection,
+    interface or session-state failure without a SQLSTATE of its own
+    (`InterfaceError`, `PendingRollbackError`, a connection error, an
+    `OSError`) is not poison whatever it wraps. asyncpg's *client-side* bind
+    failure (a lone surrogate the server would never see) surfaces as
     `asyncpg.exceptions.DataError` with `sqlstate == "22000"`, so it is class
-    22 like the server-side ones; a bare `UnicodeEncodeError` with no SQLSTATE
-    anywhere in the chain (another driver) is treated the same, as `22021`.
+    22 like the server-side ones; a bare `UnicodeEncodeError` in the cause
+    chain with no SQLSTATE anywhere (another driver) is treated the same, as
+    `22021`.
     """
     seen: set[int] = set()
     queue: list[BaseException | None] = [exc]
@@ -913,9 +949,9 @@ def poison_sqlstate(exc: BaseException) -> str | None:
                 if code.startswith(POISON_SQLSTATE_CLASS) or code in POISON_SQLSTATES:
                     return code
                 return None
-        queue.extend(
-            [getattr(e, "orig", None), e.__cause__, e.__context__]
-        )
+        if _is_connection_failure(e):
+            return None
+        queue.extend([getattr(e, "orig", None), e.__cause__])
     return "22021" if encode_error else None
 
 
@@ -1009,29 +1045,73 @@ def retain_quarantine_scopes(active) -> None:
 
 def format_quarantined(paths) -> str:
     """D5's run-record line: at most five paths, then `…`, each rendered so
-    an unencodable character can never make the record unstorable."""
+    an unencodable character can never make the record unstorable. Line
+    breaks in a path are escaped so the record stays one line, which is how
+    the panel tells a quarantining pass from a failed one
+    (`indexer_health.run_outcome`)."""
     paths = list(paths)
-    shown = [_loggable_path(p) for p in paths[:QUARANTINE_REPORT_LIMIT]]
+    shown = [
+        _loggable_path(p).replace("\n", "\\n").replace("\r", "\\r")
+        for p in paths[:QUARANTINE_REPORT_LIMIT]
+    ]
     more = ", …" if len(paths) > QUARANTINE_REPORT_LIMIT else ""
-    return f"quarantined {len(paths)} note(s): {', '.join(shown)}{more}"
+    return (
+        f"{indexer_health.QUARANTINED_RUN_PREFIX}{len(paths)} note(s): "
+        f"{', '.join(shown)}{more}"
+    )
 
 
 async def _savepoint_poison(session, run) -> BaseException | None:
     """Run `await run()` in a savepoint. Returns the exception when it is a
-    poison failure (the savepoint already rolled back, so the outer
+    poison failure **and** the savepoint rolled back cleanly (so the outer
     transaction is usable); re-raises anything else; None on success.
 
     The `try` is outside `begin_nested()` for the reason
-    `write_tsvector_bounded` gives.
+    `write_tsvector_bounded` gives. The body's own exception is captured
+    (and re-raised at once, so the context manager still rolls back): if what
+    leaves the `async with` is a *different* exception, the savepoint
+    rollback itself failed — the connection is gone or the transaction is
+    unusable — and that propagates, never returned as a recoverable poison
+    failure, whatever poison statement preceded it (C4).
     """
+    body_exc: BaseException | None = None
     try:
         async with session.begin_nested():
-            await run()
+            try:
+                await run()
+            except Exception as e:
+                body_exc = e
+                raise
     except Exception as exc:
-        if poison_sqlstate(exc) is None:
+        if exc is not body_exc or poison_sqlstate(exc) is None:
             raise
         return exc
     return None
+
+
+async def _confirm_poison(session, run, first: BaseException, *, site: str) -> str:
+    """Re-execute one note's write once more, in a fresh savepoint, before it
+    is treated as poison (C8). Returns the confirming poison SQLSTATE.
+
+    A failure that does not reproduce was not caused by the note's data — a
+    transient server condition, a one-off trigger, a concurrent change — so
+    nothing is quarantined: the original error is re-raised and the pass fails
+    as an ordinary failure, retried on the next tick. A retry that fails with
+    a non-poison error propagates that error the same way.
+    """
+    again = await _savepoint_poison(session, run)
+    if again is None:
+        # SQLSTATE only: the driver message can quote the note's content.
+        logger.error(
+            "A %s write failed with SQLSTATE %s but succeeded when retried "
+            "alone; the failure is not attributable to the note, so nothing "
+            "is quarantined and this pass fails, to be retried on the next "
+            "tick.",
+            site,
+            poison_sqlstate(first),
+        )
+        raise first
+    return poison_sqlstate(again)
 
 
 indexer_health.set_quarantine_count_provider(quarantine_count)
@@ -3134,13 +3214,17 @@ async def _index_vault_attempt(
                             tp_params["uid"] = user_id
                         await session.execute(text(move_tp_sql), tp_params)
 
-                # One savepoint per move (D3, site 1): a poison failure
-                # quarantines the destination, and the re-run treats the
-                # source as an ordinary vanished file.
+                # One savepoint per move (D3, site 1): a poison failure,
+                # confirmed by one retry (C8), quarantines the destination,
+                # and the re-run treats the source as an ordinary vanished
+                # file.
                 exc = await _savepoint_poison(session, _move)
                 if exc is not None:
+                    code = await _confirm_poison(
+                        session, _move, exc, site="move"
+                    )
                     poisoned_moves.append(PoisonCandidate(
-                        new, e["content_hash"], poison_sqlstate(exc), "move"
+                        new, e["content_hash"], code, "move"
                     ))
                     continue
 
@@ -3216,7 +3300,8 @@ async def _index_vault_attempt(
             # fails with a poison SQLSTATE is replayed a row at a time, each
             # row in its own savepoint, and **every** row that fails alone is
             # quarantined in this one restart. If none fails alone the error
-            # is not attributable to a note and is re-raised as it was.
+            # is not attributable to a note and is re-raised as it was. A row
+            # that fails alone is retried once more before it is named (C8).
             poisoned_rows: list[PoisonCandidate] = []
             for batch_start in range(0, len(to_upsert), 100):
                 batch = to_upsert[batch_start:batch_start + 100]
@@ -3227,14 +3312,18 @@ async def _index_vault_attempt(
                     continue
                 found_any = False
                 for row in batch:
-                    row_exc = await _savepoint_poison(
-                        session, lambda r=row: session.execute(_upsert_stmt([r]))
-                    )
+                    async def _row(r=row):
+                        await session.execute(_upsert_stmt([r]))
+
+                    row_exc = await _savepoint_poison(session, _row)
                     if row_exc is not None:
+                        code = await _confirm_poison(
+                            session, _row, row_exc, site="upsert"
+                        )
                         found_any = True
                         poisoned_rows.append(PoisonCandidate(
                             row["file_path"], row["content_hash"],
-                            poison_sqlstate(row_exc), "upsert",
+                            code, "upsert",
                         ))
                 if not found_any:
                     raise batch_exc
@@ -3336,15 +3425,32 @@ async def _index_vault_attempt(
                 # quarantine — the helper's own savepoint has already rolled
                 # back, so the remaining notes are still tried and every
                 # poison note of this stage goes in one restart. Any other
-                # floor failure aborts the pass with nothing committed.
+                # floor failure aborts the pass with nothing committed. A
+                # poison floor failure is retried once at the floor before it
+                # is named (C8), and the helper does not log its driver text
+                # (a 22P02 DETAIL can quote the note): the quarantine's own
+                # ERROR is the one line.
                 try:
                     await write_tsvector_bounded(
-                        session, text(tsv_sql), content, params, label=path
+                        session, text(tsv_sql), content, params, label=path,
+                        quiet_poison_floor=True,
                     )
                 except Exception as exc:
-                    code = poison_sqlstate(exc)
-                    if code is None:
+                    if poison_sqlstate(exc) is None:
                         raise
+
+                    async def _floor(content=content, params=params):
+                        await session.execute(
+                            text(tsv_sql),
+                            {
+                                **params,
+                                "content": content[:TSVECTOR_CONTENT_FLOOR_CHARS],
+                            },
+                        )
+
+                    code = await _confirm_poison(
+                        session, _floor, exc, site="keyword-vector"
+                    )
                     poisoned_tsv.append(PoisonCandidate(
                         path, upsert_hash[path], code, "keyword-vector"
                     ))
@@ -3710,7 +3816,11 @@ async def _update_links_for_changed(
                 elif note_rows:
                     exc = await _savepoint_poison(session, _insert_rows)
                     if exc is not None:
-                        poisoned.append((path, poison_sqlstate(exc)))
+                        # Confirmed by one retry before it is named (C8).
+                        code = await _confirm_poison(
+                            session, _insert_rows, exc, site="links"
+                        )
+                        poisoned.append((path, code))
                 total_rows += len(note_rows)
                 # Explicit, so the peak this block exists to bound is not held
                 # across the next note's extraction by a stale binding.

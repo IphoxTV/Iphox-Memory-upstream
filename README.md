@@ -396,7 +396,8 @@ origin the mint tools refuse rather than emit a localhost link.
   `failing_scopes`, `embedding_failing_scopes`,
   `max_consecutive_failures`, `quarantined_notes`, `last_success_at`),
   and the top-level `status` becomes `"degraded"` when the indexer task
-  has died, any index, embedding or enumeration failure counter reaches
+  has died, any index, embedding or enumeration failure counter — or a
+  scope's run of incomplete re-derives — reaches
   `INDEXER_DEGRADED_AFTER_FAILURES`, or a note is quarantined. **The HTTP
   code stays 200** — a restart cannot repair vault content or a provider
   outage, and Kubernetes uses `/health` for liveness — so **monitor the

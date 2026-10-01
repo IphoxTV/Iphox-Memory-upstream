@@ -196,11 +196,16 @@ async def test_a_poison_floor_failure_quarantines_the_note_and_commits_the_rest(
     with caplog.at_level("ERROR", logger="src.services.indexer"):
         result = await indexer.index_vault(user_id=None)
 
-    # The failure really is the floor attempt, not something upstream of it.
-    assert [
-        r for r in caplog.records
-        if "at or below the 100000-character floor" in r.getMessage()
-    ], [r.getMessage() for r in caplog.records]
+    # The failure really is the keyword-vector write, not something upstream
+    # of it. A poison floor failure is reported by the quarantine's own ERROR
+    # only — the helper's floor `logger.exception`, whose driver text can
+    # quote the note, is not emitted for it (#308 review round 1, F4).
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(
+        m.startswith("Quarantined Bad.md") and "keyword-vector" in m
+        for m in messages
+    ), messages
+    assert not any("at or below the 100000-character floor" in m for m in messages)
     assert result.quarantined == ("Bad.md",)
     async with sessionmaker() as session:
         rows = (await session.execute(select(NoteMetadata.file_path))).scalars().all()
@@ -209,7 +214,7 @@ async def test_a_poison_floor_failure_quarantines_the_note_and_commits_the_rest(
 
 
 async def test_a_non_poison_floor_failure_still_aborts_the_pass(
-    sessionmaker, vault, poison_triggers
+    sessionmaker, vault, poison_triggers, caplog
 ):
     """Outside the poison SQLSTATE set (here 55P03, lock_not_available) the
     floor failure propagates exactly as before: nothing committed."""
@@ -218,9 +223,16 @@ async def test_a_non_poison_floor_failure_still_aborts_the_pass(
     (vault / "Good.md").write_text(NORMAL, encoding="utf-8")
     await _poison.poison(sessionmaker, "tsvector", "Bad.md", "55P03")
 
-    with pytest.raises(Exception) as excinfo:
-        await indexer.index_vault(user_id=None)
+    with caplog.at_level("ERROR", logger="src.services.indexer"):
+        with pytest.raises(Exception) as excinfo:
+            await indexer.index_vault(user_id=None)
     assert indexer.poison_sqlstate(excinfo.value) is None
+    # A non-poison floor failure keeps the helper's floor log (F4 is scoped
+    # to the quarantine path).
+    assert any(
+        "at or below the 100000-character floor" in r.getMessage()
+        for r in caplog.records
+    )
 
     async with sessionmaker() as session:
         rows = (await session.execute(select(NoteMetadata.file_path))).all()

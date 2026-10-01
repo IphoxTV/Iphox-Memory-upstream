@@ -1006,3 +1006,64 @@ def test_a_non_admins_run_history_is_scoped_to_them(monkeypatch):
     monkeypatch.setattr(routes, "recent_indexer_runs", _fake_runs)
     _health_context(monkeypatch, is_admin=False)
     assert seen["user_id"] == 3
+
+
+# --------------------------------------------------------------------------
+# #308 D5: a pass that quarantined notes succeeded — "quarantined", not
+# "failed", on the strip, the health table and the performance table.
+# --------------------------------------------------------------------------
+
+_QUARANTINE_LINE = "quarantined 1 note(s): Bad.md"
+
+
+def _outcome_run(error):
+    from src.services.indexer_health import run_outcome
+
+    return _run(id=42, error=error, outcome=run_outcome(error))
+
+
+def _badges(html):
+    return re.findall(r'class="badge (badge-\w+)[^"]*"[^>]*>([a-z]+)<', html)
+
+
+def test_the_strip_marks_a_quarantining_pass_amber_not_failed():
+    strip = _render_strip(last_run=_outcome_run(_QUARANTINE_LINE))
+    strip = strip[: strip.index("Stat row")]
+    assert ("badge-yellow", "quarantined") in _badges(strip)
+    assert ("badge-red", "failed") not in _badges(strip)
+    assert "/admin/health#run-42" in strip
+
+
+def test_the_strip_still_marks_a_real_failure_red():
+    strip = _render_strip(last_run=_outcome_run(
+        _QUARANTINE_LINE + "\nembed: OSError: no space left"
+    ))
+    strip = strip[: strip.index("Stat row")]
+    assert ("badge-red", "failed") in _badges(strip)
+    assert "quarantined</" not in strip
+
+
+@pytest.mark.parametrize("error,badge", [
+    (_QUARANTINE_LINE, ("badge-yellow", "quarantined")),
+    ("index: OSError: no space left", ("badge-red", "failed")),
+    (None, ("badge-green", "ok")),
+])
+def test_the_health_table_renders_each_run_outcome(error, badge):
+    html = _render_health(runs=[_outcome_run(error)])
+    table = html[html.index("Index passes"):]
+    assert badge in _badges(table)
+    if error:
+        assert error in table, "the record's text is still shown"
+
+
+@pytest.mark.parametrize("error,badge", [
+    (_QUARANTINE_LINE, ("badge-yellow", "quarantined")),
+    ("index: OSError: no space left", ("badge-red", "failed")),
+])
+def test_the_performance_table_renders_each_run_outcome(error, badge):
+    src = open(os.path.join(TEMPLATES_DIR, "performance.html")).read()
+    start = src.index("{% if r.error and r.outcome == 'quarantined' %}")
+    end = src.index("{% endif %}", start) + len("{% endif %}")
+    html = _env().from_string(src[start:end]).render(r=_outcome_run(error))
+    assert badge in _badges(html)
+    assert 'style=' not in html

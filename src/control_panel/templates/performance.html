@@ -425,7 +425,11 @@
                     <td class="mono perf-td-num-muted">{{ r.notes_indexed }}</td>
                     <td class="mono perf-td-num-muted">{{ r.notes_embedded }}</td>
                     <td class="perf-td-sm">
-                        {% if r.error %}
+                        {% if r.error and r.outcome == 'quarantined' %}
+                            {# Succeeded without the notes it names (#308). #}
+                            <div><span class="badge badge-yellow" title="The pass succeeded without one or more notes the database refused.">quarantined</span></div>
+                            <div class="mono perf-run-error">{{ r.error }}</div>
+                        {% elif r.error %}
                             <div><span class="badge badge-red">failed</span></div>
                             <div class="mono perf-run-error">{{ r.error }}</div>
                         {% else %}

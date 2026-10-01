@@ -348,6 +348,83 @@ async def test_a_non_poison_error_at_a_site_still_aborts_the_pass(
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# C8: a failure that does not reproduce is not the note's
+# ══════════════════════════════════════════════════════════════════════════
+
+ONE_SHOT = [
+    # (site, shots, SQLSTATE). The batch upsert replays the failing batch a
+    # row at a time before it confirms, so its single-row statement is the
+    # second shot — two shots reach the confirm-retry there.
+    ("upsert", 2, "22P02"),
+    ("tsvector", 1, "54000"),
+    ("link", 1, "22021"),
+    ("move", 1, "54000"),
+]
+
+
+@pytest.mark.parametrize(
+    "site,shots,code", ONE_SHOT, ids=[s for s, _, _ in ONE_SHOT]
+)
+async def test_a_failure_the_retry_does_not_reproduce_is_not_quarantined(
+    sessionmaker, vault, caplog, site, shots, code
+):
+    """A note whose write fails once and then succeeds alone was not refused
+    for its data: nothing is quarantined, the pass fails as an ordinary
+    failure with nothing committed, and the next tick indexes the note."""
+    (vault / "Good.md").write_text("good\n", encoding="utf-8")
+    if site == "move":
+        (vault / "Old.md").write_text("old body\n", encoding="utf-8")
+        await indexer.index_vault()
+        os.rename(vault / "Old.md", vault / "New.md")
+        bad = "New.md"
+    else:
+        (vault / "Bad.md").write_text("bad body [[Good]]\n", encoding="utf-8")
+        bad = "Bad.md"
+    before = await paths(sessionmaker)
+    await _poison.poison(sessionmaker, site, bad, code, shots=shots)
+
+    with caplog.at_level("INFO", logger="src.services.indexer"):
+        with pytest.raises(Exception) as excinfo:
+            await indexer.index_vault()
+    assert indexer.poison_sqlstate(excinfo.value) == code
+    assert indexer.quarantine_count() == 0
+    assert restarts(caplog) == 0
+    assert not any(
+        r.getMessage().startswith("Quarantined ") for r in caplog.records
+    )
+    assert any(
+        "succeeded when retried alone" in r.getMessage() for r in caplog.records
+    ), "the confirm-retry itself is what declined the quarantine"
+    assert await paths(sessionmaker) == before, "nothing from the pass commits"
+
+    result = await indexer.index_vault()
+    assert result.quarantined == ()
+    assert await row(sessionmaker, bad) is not None, "indexed on the next tick"
+    if site == "move":
+        assert await row(sessionmaker, "Old.md") is None
+
+
+async def test_a_quarantined_keyword_vector_logs_one_error_without_driver_text(
+    sessionmaker, vault, caplog
+):
+    """F4: the floor failure of a note that is quarantined is reported once,
+    by the quarantine's own ERROR (path and SQLSTATE) — not also by the
+    helper's `logger.exception`, whose driver message can quote the note."""
+    (vault / "Bad.md").write_text("zanzibarish secret body\n", encoding="utf-8")
+    await _poison.poison(sessionmaker, "tsvector", "Bad.md", "22P02")
+
+    with caplog.at_level("INFO", logger="src.services.indexer"):
+        result = await indexer.index_vault()
+    assert result.quarantined == ("Bad.md",)
+    errors = [r for r in caplog.records if r.levelno >= 40]
+    assert len(errors) == 1, [r.getMessage() for r in errors]
+    message = errors[0].getMessage()
+    assert message.startswith("Quarantined ") and "22P02" in message
+    assert errors[0].exc_info is None
+    assert "zanzibarish" not in message and "synthetic" not in message
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # The lone surrogate: asyncpg's client-side refusal
 # ══════════════════════════════════════════════════════════════════════════
 

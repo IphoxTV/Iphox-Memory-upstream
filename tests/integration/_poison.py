@@ -16,28 +16,47 @@ failure is planted with triggers driven by a rules table:
   `notes_metadata`, which no single row reproduces (the path is ignored).
 
 Each rule raises the SQLSTATE it names (default 54000, program_limit_exceeded).
+
+A rule with `shots` fails only that many times, then stops (#308 C8, the
+confirm-retry): the count is drawn from a sequence, which is not
+transactional, so the savepoint rollback of the failing statement does not
+give the shot back. One limited rule at a time — `poison()` restarts the
+sequence.
 """
 from sqlalchemy import text
 
 _INSTALL = [
     "CREATE TABLE IF NOT EXISTS poison_rules ("
     "  site text NOT NULL, path text NOT NULL, "
-    "  errcode text NOT NULL DEFAULT '54000')",
+    "  errcode text NOT NULL DEFAULT '54000', shots integer)",
+    "CREATE SEQUENCE IF NOT EXISTS poison_shot_seq",
+    """
+    CREATE OR REPLACE FUNCTION poison_fire(code text, shots integer)
+    RETURNS text LANGUAGE plpgsql AS $$
+    BEGIN
+      IF code IS NOT NULL AND shots IS NOT NULL
+         AND nextval('poison_shot_seq') > shots THEN
+        RETURN NULL;
+      END IF;
+      RETURN code;
+    END $$
+    """,
     """
     CREATE OR REPLACE FUNCTION poison_notes() RETURNS trigger
     LANGUAGE plpgsql AS $$
-    DECLARE code text;
+    DECLARE code text; n integer;
     BEGIN
       IF TG_OP = 'INSERT' THEN
-        SELECT errcode INTO code FROM poison_rules
+        SELECT errcode, shots INTO code, n FROM poison_rules
          WHERE site = 'upsert' AND path = NEW.file_path;
       ELSIF NEW.file_path IS DISTINCT FROM OLD.file_path THEN
-        SELECT errcode INTO code FROM poison_rules
+        SELECT errcode, shots INTO code, n FROM poison_rules
          WHERE site = 'move' AND path = NEW.file_path;
       ELSIF NEW.content_tsvector IS DISTINCT FROM OLD.content_tsvector THEN
-        SELECT errcode INTO code FROM poison_rules
+        SELECT errcode, shots INTO code, n FROM poison_rules
          WHERE site = 'tsvector' AND path = NEW.file_path;
       END IF;
+      code := poison_fire(code, n);
       IF code IS NOT NULL THEN
         RAISE EXCEPTION 'synthetic % failure for a test', TG_OP
           USING ERRCODE = code;
@@ -48,12 +67,13 @@ _INSTALL = [
     """
     CREATE OR REPLACE FUNCTION poison_links() RETURNS trigger
     LANGUAGE plpgsql AS $$
-    DECLARE code text;
+    DECLARE code text; k integer;
     BEGIN
-      SELECT r.errcode INTO code
+      SELECT r.errcode, r.shots INTO code, k
         FROM poison_rules r JOIN notes_metadata n ON n.file_path = r.path
        WHERE r.site = 'link' AND n.id = NEW.source_note_id
        LIMIT 1;
+      code := poison_fire(code, k);
       IF code IS NOT NULL THEN
         RAISE EXCEPTION 'synthetic link failure for a test'
           USING ERRCODE = code;
@@ -95,7 +115,9 @@ _UNINSTALL = [
     "DROP FUNCTION IF EXISTS poison_batch()",
     "DROP FUNCTION IF EXISTS poison_notes()",
     "DROP FUNCTION IF EXISTS poison_links()",
+    "DROP FUNCTION IF EXISTS poison_fire(text, integer)",
     "DROP TABLE IF EXISTS poison_rules",
+    "DROP SEQUENCE IF EXISTS poison_shot_seq",
 ]
 
 
@@ -113,11 +135,19 @@ async def uninstall(sessionmaker) -> None:
         await session.commit()
 
 
-async def poison(sessionmaker, site: str, path: str, errcode: str = "54000") -> None:
+async def poison(
+    sessionmaker, site: str, path: str, errcode: str = "54000",
+    shots: int | None = None,
+) -> None:
     async with sessionmaker() as session:
+        if shots is not None:
+            await session.execute(text("ALTER SEQUENCE poison_shot_seq RESTART"))
         await session.execute(
-            text("INSERT INTO poison_rules (site, path, errcode) VALUES (:s, :p, :c)"),
-            {"s": site, "p": path, "c": errcode},
+            text(
+                "INSERT INTO poison_rules (site, path, errcode, shots) "
+                "VALUES (:s, :p, :c, :n)"
+            ),
+            {"s": site, "p": path, "c": errcode, "n": shots},
         )
         await session.commit()
 

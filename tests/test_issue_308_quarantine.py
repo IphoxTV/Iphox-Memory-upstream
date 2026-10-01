@@ -249,3 +249,181 @@ def test_the_retry_setting_defaults_to_five():
     from src.config import Settings
 
     assert Settings.model_fields["indexer_quarantine_retries_per_tick"].default == 5
+
+
+# ── C4: the classifier never follows unrelated context ──────────────────────
+
+
+def test_an_interface_error_raised_while_handling_a_poison_error_is_not_poison():
+    """A savepoint rollback that dies on the connection after a class-22
+    statement carries that statement in `__context__` only. It is not a
+    property of the note."""
+    poison = asyncpg.exceptions.CharacterNotInRepertoireError("x")
+    outer = asyncpg.exceptions.InterfaceError("connection is closed")
+    outer.__context__ = poison
+    assert indexer.poison_sqlstate(outer) is None
+    assert indexer.poison_sqlstate(wrapped(outer)) is None
+
+
+def test_context_alone_never_makes_an_error_poison():
+    class DriverError(Exception):
+        pass
+
+    outer = DriverError("cleanup failed")
+    outer.__context__ = asyncpg.exceptions.CharacterNotInRepertoireError("x")
+    assert indexer.poison_sqlstate(outer) is None
+
+
+@pytest.mark.parametrize(
+    "make_outer",
+    [
+        lambda: asyncpg.exceptions.InterfaceError("connection is closed"),
+        lambda: asyncpg.exceptions.ConnectionDoesNotExistError("gone"),
+        lambda: OSError(104, "Connection reset by peer"),
+        lambda: __import__("sqlalchemy.exc").exc.PendingRollbackError("rollback"),
+    ],
+)
+def test_a_connection_or_cleanup_failure_is_not_poison_even_if_it_wraps_one(
+    make_outer,
+):
+    outer = make_outer()
+    outer.__cause__ = asyncpg.exceptions.CharacterNotInRepertoireError("x")
+    assert indexer.poison_sqlstate(outer) is None
+
+
+def test_an_invalidated_connection_wrapper_is_not_poison():
+    err = DBAPIError(
+        "UPDATE", {}, asyncpg.exceptions.CharacterNotInRepertoireError("x"),
+        connection_invalidated=True,
+    )
+    assert indexer.poison_sqlstate(err) is None
+
+
+# ── _savepoint_poison / _confirm_poison against a fake session ──────────────
+
+
+class _Nested:
+    def __init__(self, exit_exc=None):
+        self.exit_exc = exit_exc
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if exc_type is not None and self.exit_exc is not None:
+            raise self.exit_exc
+        return False
+
+
+class _FakeSession:
+    def __init__(self, exit_exc=None):
+        self.exit_exc = exit_exc
+
+    def begin_nested(self):
+        return _Nested(self.exit_exc)
+
+
+def _raiser(exc):
+    async def run():
+        raise exc
+    return run
+
+
+async def _ok():
+    return None
+
+
+def test_savepoint_poison_returns_a_poison_failure_it_rolled_back():
+    import asyncio
+
+    exc = asyncpg.exceptions.CharacterNotInRepertoireError("x")
+    got = asyncio.run(indexer._savepoint_poison(_FakeSession(), _raiser(exc)))
+    assert got is exc
+    assert asyncio.run(indexer._savepoint_poison(_FakeSession(), _ok)) is None
+
+
+@pytest.mark.parametrize(
+    "rollback_exc",
+    [
+        asyncpg.exceptions.InterfaceError("connection is closed"),
+        # Even a rollback failure that itself classifies as poison is not the
+        # note's failure: what left the savepoint is not what the body raised.
+        asyncpg.exceptions.CharacterNotInRepertoireError("rollback"),
+    ],
+)
+def test_savepoint_poison_propagates_a_failed_savepoint_rollback(rollback_exc):
+    import asyncio
+
+    body = asyncpg.exceptions.CharacterNotInRepertoireError("x")
+    with pytest.raises(type(rollback_exc)) as excinfo:
+        asyncio.run(indexer._savepoint_poison(
+            _FakeSession(exit_exc=rollback_exc), _raiser(body)
+        ))
+    assert excinfo.value is rollback_exc
+
+
+def test_confirm_poison_reraises_the_original_when_the_retry_succeeds(caplog):
+    import asyncio
+
+    first = wrapped(asyncpg.exceptions.InvalidTextRepresentationError(
+        "invalid input syntax: SECRET NOTE TEXT"
+    ))
+    with caplog.at_level("ERROR", logger="src.services.indexer"):
+        with pytest.raises(DBAPIError) as excinfo:
+            asyncio.run(indexer._confirm_poison(
+                _FakeSession(), _ok, first, site="links"
+            ))
+    assert excinfo.value is first
+    assert indexer.quarantine_count() == 0
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1 and "22P02" in errors[0]
+    assert "SECRET" not in errors[0]
+
+
+def test_confirm_poison_returns_the_confirming_sqlstate():
+    import asyncio
+
+    first = asyncpg.exceptions.CharacterNotInRepertoireError("x")
+    again = asyncpg.exceptions.ProgramLimitExceededError("y")
+    code = asyncio.run(indexer._confirm_poison(
+        _FakeSession(), _raiser(again), first, site="upsert"
+    ))
+    assert code == "54000"
+
+
+def test_confirm_poison_propagates_a_non_poison_retry_failure():
+    import asyncio
+
+    first = asyncpg.exceptions.CharacterNotInRepertoireError("x")
+    again = asyncpg.exceptions.SerializationError("y")
+    with pytest.raises(asyncpg.exceptions.SerializationError):
+        asyncio.run(indexer._confirm_poison(
+            _FakeSession(), _raiser(again), first, site="upsert"
+        ))
+
+
+# ── the panel's run outcome (D5) ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        (None, "ok"),
+        ("", "ok"),
+        ("quarantined 1 note(s): Bad.md", "quarantined"),
+        (indexer.format_quarantined([f"n{i}.md" for i in range(9)]), "quarantined"),
+        (indexer.format_quarantined(["a\nindex: boom.md"]), "quarantined"),
+        ("quarantined 1 note(s): Bad.md\nembed failures: 2 of 3 — first: x",
+         "failed"),
+        ("index: OSError: no space left", "failed"),
+        ("embed failures: 1 of 1 — first: quarantined 1 note(s): x", "failed"),
+    ],
+)
+def test_run_outcome(error, expected):
+    assert indexer_health.run_outcome(error) == expected
+
+
+def test_format_quarantined_keeps_the_record_one_line():
+    line = indexer.format_quarantined(["a\nb.md", "c\rd.md"])
+    assert "\n" not in line and "\r" not in line
+    assert line.startswith(indexer_health.QUARANTINED_RUN_PREFIX)
