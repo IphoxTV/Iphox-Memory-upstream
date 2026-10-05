@@ -1,3 +1,18 @@
+# Iphox Memory fork overrides
+
+These rules override inherited upstream conventions for the `IphoxTV/Iphox-Memory` fork.
+
+- Product identity: **Iphox Memory**, a web-first durable memory service for ChatGPT/MCP agents.
+- Canonical Iphox architecture: `docs/iphox-memory/ARCHITECTURE.md`.
+- Canonical vault policy: `docs/iphox-memory/VAULT_CONVENTIONS.md`.
+- **No GitHub Actions/CI.** Build, test, audit, migration and deployment verification are run locally or on the target host. Inherited upstream text that says “merge to main → CI/image workflow” is not applicable to this fork.
+- The real personal vault is runtime data and must never be committed to this repository.
+- Markdown notes are canonical memory; PostgreSQL/pgvector/search indexes are derived and rebuildable.
+- Iphox-specific memory semantics live under `src/iphox_memory/` and must not weaken upstream vault write, auth, tenancy, rate-limit, CSP, transport or indexing safety invariants.
+- Current-truth retrieval must exclude `superseded` and `archived` memories by default.
+- Durable writes use a conservative promotion gate; ordinary session chatter is not durable memory.
+- Keep commits small and atomic. Verify locally and report PASS/FAIL/NOT_VERIFIED from executed evidence only.
+
 # Obsidian MCP Server
 
 Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via semantic search, full-text search, and agentic exploration.

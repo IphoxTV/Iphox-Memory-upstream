@@ -1,3 +1,9 @@
+# Iphox fork note
+
+For this fork, read the **Iphox Memory fork overrides** at the top of [CLAUDE.md](CLAUDE.md)
+before applying inherited upstream guidance. In particular, GitHub Actions/CI are disabled;
+verification is local/target-host only.
+
 # Project conventions
 
 Read and follow [CLAUDE.md](CLAUDE.md) before working in this repository. It is
